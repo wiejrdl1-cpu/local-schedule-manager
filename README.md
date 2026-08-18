@@ -2,6 +2,9 @@
 
 공공기관 업무용 PC에서 인터넷이나 외부 서버 없이 실행하는 개인용 민원·수시업무 기한 관리 MVP입니다.
 
+- [최신 Windows EXE 내려받기](https://github.com/wiejrdl1-cpu/local-schedule-manager/releases/latest)
+- [변경 이력](CHANGELOG.md)
+
 ## 현재 구현된 기능
 
 - 민원 신청 처리 및 수기 등록
@@ -46,6 +49,24 @@ python app.py
 
 처음 실행하면 현재 Windows 사용자 계정에 맞춰 데이터 보호가 자동으로 설정됩니다.
 
+## Windows EXE
+
+GitHub Release에서 `LocalScheduleManager.exe`를 내려받으면 Python 설치 없이 실행할 수 있습니다. Windows가 처음 실행하는 파일에 대해 보호 경고를 표시할 수 있으므로, 배포 전 기관 내부 보안 기준에 따라 검사한 뒤 사용하세요.
+
+개발자가 EXE를 다시 만들 때는 PowerShell에서 다음 명령을 실행합니다.
+
+```powershell
+& '.\빌드.ps1' -InstallDependencies
+```
+
+의존성이 이미 설치된 이후에는 다음 명령만 실행합니다.
+
+```powershell
+& '.\빌드.ps1'
+```
+
+완성 파일은 `dist\LocalScheduleManager.exe`에 생성됩니다. 프로그램 데이터는 EXE 옆이 아니라 `%LOCALAPPDATA%\업무기한관리`에 저장됩니다.
+
 ## 데이터 저장
 
 기본 데이터 위치는 `%LOCALAPPDATA%\업무기한관리\schedule.db`입니다. 테스트나 별도 내부 폴더 사용 시 환경변수로 바꿀 수 있습니다.
@@ -69,9 +90,8 @@ python app.py
 
 실제 기관 엑셀의 열 제목이 다르면 `excel_import.py`의 `ALIASES`에 별칭을 추가할 수 있습니다.
 
-## 아직 남은 배포 작업
+## 이후 검토할 작업
 
 - 실제 비식별 `받은민원.xls`로 열 및 날짜 형식 최종 검증
-- 설치 없이 실행할 수 있는 단일 `.exe` 패키징
 - 창을 닫아도 알림을 유지하는 트레이 상주 모드
 - 휴일/평일 기준 민원 처리기한 규칙
