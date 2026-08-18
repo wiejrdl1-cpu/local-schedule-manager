@@ -599,14 +599,6 @@ class ScheduleApp(tk.Tk):
                         command=lambda complaint_id=int(complaint["id"]), key=stage_key, variable=checked: self._toggle_progress_node(complaint_id, key, variable.get()),
                     )
                     canvas.create_window(left + stage_width / 2, 51, window=check)
-            canvas.create_text(
-                max(10, width // 2 - 2),
-                82,
-                text=self._definition_text_from_key(current_key, stages),
-                fill=PALETTE["text"],
-                font=(self.ui_font, 9, "bold"),
-            )
-
             def select_row(_event: tk.Event, row_id: str = iid) -> None:
                 self._select_tree_row(self.complaint_tree, row_id, _event)
 
@@ -671,7 +663,6 @@ class ScheduleApp(tk.Tk):
                     command=lambda task_id=int(task["id"]), node=key, variable=checked: self._toggle_task_progress(task_id, node, variable.get()),
                 )
                 canvas.create_window(left + stage_width / 2, 50, window=check)
-            canvas.create_text(width / 2, 80, text=self._task_stage_text(current, stages), fill=PALETTE["text"], font=(self.ui_font, 10, "bold"))
             canvas.bind("<Button-1>", lambda event, row_id=iid: self._select_tree_row(self.task_tree, row_id, event))
             canvas.bind("<Double-1>", lambda _e, row_id=iid: (self.task_tree.selection_set(row_id), self.edit_task_dialog()))
             edit_bounds = self.task_tree.bbox(iid, "progress_edit")
