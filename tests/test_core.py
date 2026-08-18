@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from database import Database
+from database import Database, RELEASE_APP_DIR_NAME, default_data_dir
 from excel_import import apply_import, preview_import
 
 
@@ -21,6 +24,12 @@ class CoreFlowTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.db.close()
         self.temp.cleanup()
+
+    def test_packaged_app_uses_separate_empty_data_directory(self) -> None:
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root)}, clear=False):
+            os.environ.pop("DDAY_MANAGER_DATA_DIR", None)
+            with patch.object(sys, "frozen", True, create=True):
+                self.assertEqual(default_data_dir(), self.root / RELEASE_APP_DIR_NAME)
 
     def _write_excel(
         self,

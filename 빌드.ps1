@@ -37,6 +37,8 @@ try {
         --onefile `
         --windowed `
         --name 'LocalScheduleManager' `
+        --icon 'assets\app_icon.ico' `
+        --add-data 'assets\app_icon.ico;assets' `
         --paths '.vendor' `
         --hidden-import 'xlrd' `
         app.py

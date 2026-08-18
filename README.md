@@ -1,5 +1,7 @@
 # 내 일정 관리하기
 
+<img src="assets/app_icon.png" alt="내 일정 관리하기 아이콘" width="128">
+
 공공기관 업무용 PC에서 인터넷이나 외부 서버 없이 실행하는 개인용 민원·수시업무 기한 관리 MVP입니다.
 
 - [최신 Windows EXE 내려받기](https://github.com/wiejrdl1-cpu/local-schedule-manager/releases/latest)
@@ -65,11 +67,11 @@ GitHub Release에서 `LocalScheduleManager.exe`를 내려받으면 Python 설치
 & '.\빌드.ps1'
 ```
 
-완성 파일은 `dist\LocalScheduleManager.exe`에 생성됩니다. 프로그램 데이터는 EXE 옆이 아니라 `%LOCALAPPDATA%\업무기한관리`에 저장됩니다.
+완성 파일은 `dist\LocalScheduleManager.exe`에 생성됩니다. 배포용 EXE의 프로그램 데이터는 EXE 옆이 아니라 `%LOCALAPPDATA%\내일정관리`에 저장됩니다.
 
 ## 데이터 저장
 
-기본 데이터 위치는 `%LOCALAPPDATA%\업무기한관리\schedule.db`입니다. 테스트나 별도 내부 폴더 사용 시 환경변수로 바꿀 수 있습니다.
+소스코드 실행 데이터는 `%LOCALAPPDATA%\업무기한관리\schedule.db`, 배포용 EXE 데이터는 `%LOCALAPPDATA%\내일정관리\schedule.db`에 저장됩니다. 두 실행 환경을 분리하므로 새 EXE는 기존 개발용 업무를 불러오지 않고 0건에서 시작합니다. 기존 개발용 데이터는 삭제하지 않습니다.
 
 ```powershell
 $env:DDAY_MANAGER_DATA_DIR = 'D:\기관내부폴더\업무기한관리'

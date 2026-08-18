@@ -45,6 +45,11 @@ DEFAULT_TASK_STAGES = [
 PROGRESS_COLORS = {"completed": "#E34F4F", "current": "#3E82D7", "pending": "#C9CECA"}
 
 
+def resource_path(relative_path: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative_path
+
+
 def parse_deadline(value: str) -> datetime:
     text = value.strip()
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
@@ -159,6 +164,12 @@ class ScheduleApp(tk.Tk):
         self._task_progress_buttons: list[ttk.Button] = []
         self._task_progress: dict[str, tuple[dict[str, object], str]] = {}
         self.title(APP_TITLE)
+        icon_path = resource_path("assets/app_icon.ico")
+        if icon_path.exists():
+            try:
+                self.iconbitmap(default=str(icon_path))
+            except tk.TclError:
+                pass
         self.geometry("1500x900")
         self.minsize(1200, 760)
         self.protocol("WM_DELETE_WINDOW", self.on_close)

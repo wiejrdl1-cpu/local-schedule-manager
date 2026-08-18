@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from security import DataProtector
 
 
 APP_DIR_NAME = "업무기한관리"
+RELEASE_APP_DIR_NAME = "내일정관리"
 
 
 def default_data_dir() -> Path:
@@ -18,7 +20,8 @@ def default_data_dir() -> Path:
     if override:
         return Path(override)
     base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-    return base / APP_DIR_NAME
+    app_dir_name = RELEASE_APP_DIR_NAME if getattr(sys, "frozen", False) else APP_DIR_NAME
+    return base / app_dir_name
 
 
 class Database:
