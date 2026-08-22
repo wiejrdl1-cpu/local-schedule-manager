@@ -124,7 +124,10 @@ class FormDialog(tk.Toplevel):
             else:
                 widget = ttk.Entry(body, width=46)
                 widget.insert(0, default)
-            widget.grid(row=row, column=1, sticky="ew", pady=6)
+            is_multiline = isinstance(widget, tk.Text)
+            widget.grid(row=row, column=1, sticky="nsew" if is_multiline else "ew", pady=6)
+            if is_multiline:
+                body.rowconfigure(row, weight=1)
             self.entries[key] = widget
         buttons = ttk.Frame(body)
         buttons.grid(row=len(fields), column=0, columnspan=2, sticky="e", pady=(14, 0))
@@ -210,15 +213,17 @@ class ScheduleApp(tk.Tk):
         style.map("Accent.TButton", background=[("active", PALETTE["background"]), ("pressed", PALETTE["background"])], foreground=[("active", "#111111")])
         style.configure("Edit.TButton", font=(self.ui_font, 10, "bold"), background=PALETTE["background"], foreground="#111111", bordercolor=PALETTE["border"])
         style.map("Edit.TButton", background=[("active", PALETTE["background"]), ("pressed", PALETTE["background"])], foreground=[("active", "#111111")])
+        style.configure("SelectedEdit.TButton", font=(self.ui_font, 10, "bold"), background="#A9DDA4", foreground="#173B23", bordercolor="#71906F")
+        style.map("SelectedEdit.TButton", background=[("active", "#A9DDA4"), ("pressed", "#8CCB87")], foreground=[("active", "#173B23")])
         style.configure("Nav.TButton", font=(self.ui_font, 10, "bold"), padding=(14, 10), background=PALETTE["background"], foreground="#111111", bordercolor=PALETTE["border"])
         style.map("Nav.TButton", background=[("active", PALETTE["background"]), ("pressed", PALETTE["background"])], foreground=[("active", "#111111")])
         style.configure("NavActive.TButton", font=(self.ui_font, 10, "bold"), padding=(14, 10), background=PALETTE["green_dark"], foreground="#FFFFFF", bordercolor=PALETTE["green_dark"])
         style.map("NavActive.TButton", background=[("active", PALETTE["green_dark"]), ("pressed", PALETTE["green_dark"])], foreground=[("active", "#FFFFFF")])
         style.layout("Hidden.TNotebook.Tab", [])
         style.configure("Hidden.TNotebook", background=PALETTE["background"], borderwidth=0, tabmargins=0)
-        style.configure("Treeview", rowheight=100, font=(self.ui_font, 9), background=PALETTE["surface"], fieldbackground=PALETTE["surface"], foreground=PALETTE["text"], bordercolor=PALETTE["border"])
+        style.configure("Treeview", rowheight=100, font=(self.ui_font, 9), background=PALETTE["surface"], fieldbackground=PALETTE["surface"], foreground=PALETTE["text"], bordercolor="#B8C9B5", borderwidth=1, relief="solid")
         style.map("Treeview", background=[("selected", "#A9DDA4")], foreground=[("selected", "#173B23")])
-        style.configure("Treeview.Heading", font=(self.ui_font, 9, "bold"), background=PALETTE["green_soft"], foreground=PALETTE["green_dark"], bordercolor=PALETTE["border"])
+        style.configure("Treeview.Heading", font=(self.ui_font, 9, "bold"), background=PALETTE["green_soft"], foreground=PALETTE["green_dark"], bordercolor="#D9E5D6")
         style.map("Treeview.Heading", background=[("active", "#C4E7B9")])
 
     def _build_ui(self) -> None:
@@ -544,12 +549,13 @@ class ScheduleApp(tk.Tk):
             "normal": "#F5FCEF", "soon7": "#FFF7CF", "soon3": "#FFE4BD",
             "today": "#FFD0D0", "overdue": "#FFBCBC", "completed": "#E8F2E5",
         }
+        selected_rows = set(self.complaint_tree.selection())
         for iid, (complaint, tag) in self._complaint_progress.items():
             bounds = self.complaint_tree.bbox(iid, "progress")
             if not bounds:
                 continue
             x, y, width, height = bounds
-            background = row_backgrounds.get(tag, "#FFFFFF")
+            background = "#A9DDA4" if iid in selected_rows else row_backgrounds.get(tag, "#FFFFFF")
             canvas = tk.Canvas(
                 self.complaint_tree,
                 width=max(20, width - 4),
@@ -621,11 +627,12 @@ class ScheduleApp(tk.Tk):
                 edit_button = ttk.Button(
                     self.complaint_tree,
                     text="수정",
-                    style="Edit.TButton",
+                    style="SelectedEdit.TButton" if iid in selected_rows else "Edit.TButton",
                     command=lambda complaint_id=int(complaint["id"]): self.open_item_stage_editor("complaint", complaint_id),
                 )
                 edit_button.place(x=edit_x + 10, y=edit_y + max(8, (edit_height - 38) // 2), width=max(70, edit_width - 20), height=38)
                 self._complaint_progress_buttons.append(edit_button)
+        self._draw_tree_grid(self.complaint_tree)
 
     def _draw_task_progress(self) -> None:
         if not hasattr(self, "task_tree") or not self.task_tree.winfo_exists():
@@ -640,12 +647,13 @@ class ScheduleApp(tk.Tk):
             "normal": "#F5FCEF", "soon7": "#FFF7CF", "soon3": "#FFE4BD",
             "today": "#FFD0D0", "overdue": "#FFBCBC", "completed": "#E8F2E5",
         }
+        selected_rows = set(self.task_tree.selection())
         for iid, (task, tag) in self._task_progress.items():
             bounds = self.task_tree.bbox(iid, "progress")
             if not bounds:
                 continue
             x, y, width, height = bounds
-            background = row_backgrounds.get(tag, "#FFFFFF")
+            background = "#A9DDA4" if iid in selected_rows else row_backgrounds.get(tag, "#FFFFFF")
             canvas = tk.Canvas(self.task_tree, width=max(20, width - 4), height=max(20, height - 2), background=background, highlightthickness=0)
             canvas.place(x=x + 2, y=y + 1)
             self._task_progress_canvases.append(canvas)
@@ -682,16 +690,88 @@ class ScheduleApp(tk.Tk):
                 edit_button = ttk.Button(
                     self.task_tree,
                     text="수정",
-                    style="Edit.TButton",
+                    style="SelectedEdit.TButton" if iid in selected_rows else "Edit.TButton",
                     command=lambda task_id=int(task["id"]): self.open_item_stage_editor("task", task_id),
                 )
                 edit_button.place(x=edit_x + 10, y=edit_y + max(8, (edit_height - 38) // 2), width=max(70, edit_width - 20), height=38)
                 self._task_progress_buttons.append(edit_button)
+        self._draw_tree_grid(self.task_tree)
+
+    def _draw_tree_grid(self, tree: ttk.Treeview) -> None:
+        if not tree.winfo_exists():
+            return
+        for line in getattr(tree, "_grid_lines", []):
+            if line.winfo_exists():
+                line.destroy()
+        tree._grid_lines = []  # type: ignore[attr-defined]
+
+        configured = tree.cget("displaycolumns")
+        if configured in ("#all", ("#all",)):
+            display_columns = list(tree.cget("columns"))
+        elif isinstance(configured, str):
+            display_columns = list(tree.tk.splitlist(configured))
+        else:
+            display_columns = list(configured)
+        if not display_columns:
+            return
+
+        visible_rows: list[tuple[str, tuple[int, int, int, int]]] = []
+        first_column = display_columns[0]
+        for iid in tree.get_children(""):
+            bounds = tree.bbox(iid, first_column)
+            if bounds:
+                visible_rows.append((iid, bounds))
+
+        tree_width = tree.winfo_width()
+        tree_height = tree.winfo_height()
+        if tree_width <= 1 or tree_height <= 1:
+            return
+
+        vertical_positions = {0}
+        if visible_rows:
+            sample_iid = visible_rows[0][0]
+            for column in display_columns:
+                bounds = tree.bbox(sample_iid, column)
+                if bounds:
+                    x, _y, width, _height = bounds
+                    vertical_positions.update((x, x + width))
+        else:
+            x = 0
+            for column in display_columns:
+                x += int(tree.column(column, "width"))
+                vertical_positions.add(x)
+
+        for x in sorted(vertical_positions):
+            if 0 <= x < tree_width:
+                line = tk.Frame(tree, background="#D9E5D6", width=1, takefocus=0)
+                line.place(x=x, y=0, width=1, height=tree_height)
+                line.lift()
+                tree._grid_lines.append(line)  # type: ignore[attr-defined]
+
+        horizontal_positions: set[int] = set()
+        for _iid, (_x, y, _width, height) in visible_rows:
+            horizontal_positions.update((y, y + height))
+        heading_bottom = max(
+            (y + 1 for y in range(min(80, tree_height)) if tree.identify_region(2, y) == "heading"),
+            default=0,
+        )
+        if heading_bottom:
+            horizontal_positions.add(heading_bottom)
+        for y in sorted(horizontal_positions):
+            if 0 <= y < tree_height:
+                is_heading_border = y == heading_bottom
+                thickness = 2 if is_heading_border else 1
+                color = "#71906F" if is_heading_border else "#B8C9B5"
+                line = tk.Frame(tree, background=color, height=thickness, takefocus=0)
+                line.place(x=0, y=y, width=tree_width, height=thickness)
+                line.lift()
+                tree._grid_lines.append(line)  # type: ignore[attr-defined]
 
     def _new_tree(self, parent: tk.Misc, columns: tuple[str, ...], headings: tuple[str, ...], widths: tuple[int, ...]) -> ttk.Treeview:
         wrapper = ttk.Frame(parent)
         wrapper.pack(fill="both", expand=True)
         tree = ttk.Treeview(wrapper, columns=columns, show="headings", selectmode="extended")
+        tree._grid_lines = []  # type: ignore[attr-defined]
         def scroll_command(*args: str) -> None:
             tree.yview(*args)
             self.after_idle(lambda: self._redraw_progress_if_needed(tree))
@@ -724,6 +804,7 @@ class ScheduleApp(tk.Tk):
         tree.bind("<Button-1>", clear_selection_on_blank, add="+")
         tree.bind("<Configure>", lambda _e: self.after_idle(lambda: self._redraw_progress_if_needed(tree)), add="+")
         tree.bind("<MouseWheel>", lambda _e: self.after(30, lambda: self._redraw_progress_if_needed(tree)), add="+")
+        tree.bind("<<TreeviewSelect>>", lambda _e: self.after_idle(lambda: self._redraw_progress_if_needed(tree)), add="+")
         return tree
 
     def _sort_tree(self, tree: ttk.Treeview, column: str) -> None:
@@ -757,8 +838,10 @@ class ScheduleApp(tk.Tk):
     def _redraw_progress_if_needed(self, tree: ttk.Treeview) -> None:
         if getattr(self, "complaint_tree", None) is tree:
             self._draw_complaint_progress()
-        if getattr(self, "task_tree", None) is tree:
+        elif getattr(self, "task_tree", None) is tree:
             self._draw_task_progress()
+        else:
+            self._draw_tree_grid(tree)
 
     @staticmethod
     def _select_tree_row(tree: ttk.Treeview, row_id: str, event: tk.Event) -> None:
@@ -2111,11 +2194,11 @@ class ScheduleApp(tk.Tk):
         if hasattr(self, "import_window") and self.import_window.winfo_exists():
             self.import_window.destroy()
 
-    @staticmethod
-    def _clear_tree(tree: ttk.Treeview) -> None:
+    def _clear_tree(self, tree: ttk.Treeview) -> None:
         children = tree.get_children()
         if children:
             tree.delete(*children)
+        self.after_idle(lambda: self._redraw_progress_if_needed(tree))
 
     def refresh_all(self) -> None:
         self.refresh_complaints()
