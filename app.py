@@ -2797,11 +2797,15 @@ class ScheduleApp(tk.Tk):
             self.calendar_month.month,
         )
         today = date.today()
-        korean_holidays = holidays.country_holidays(
-            "KR",
-            years=[self.calendar_month.year],
-            language="ko",
-        )
+        try:
+            korean_holidays = holidays.country_holidays(
+                "KR",
+                years=[self.calendar_month.year],
+                language="ko",
+            )
+        except (FileNotFoundError, OSError):
+            # 배포 파일에 번역 리소스가 누락되더라도 달력 전체가 종료되지 않게 한다.
+            korean_holidays = {}
         for row, week in enumerate(weeks):
             self.calendar_days_frame.rowconfigure(row, weight=1, uniform="calendar-row")
             for column, day in enumerate(week):

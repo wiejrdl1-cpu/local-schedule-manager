@@ -39,6 +39,7 @@ try {
         --name 'LocalScheduleManager' `
         --icon 'assets\app_icon.ico' `
         --add-data 'assets\app_icon.ico;assets' `
+        --collect-data 'holidays' `
         --paths '.vendor' `
         --hidden-import 'xlrd' `
         app.py
