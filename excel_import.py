@@ -11,6 +11,8 @@ if VENDOR_DIR.exists() and str(VENDOR_DIR) not in sys.path:
     sys.path.insert(0, str(VENDOR_DIR))
 
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
 
 from database import Database
 
@@ -26,6 +28,15 @@ ALIASES = {
     "intake_type": ["접수구분", "접수경로", "신청구분"],
     "assignee": ["담당자", "처리담당자"],
 }
+
+TASK_ALIASES = {
+    "title": ["업무제목", "업무 제목"],
+    "registered_at": ["등록일", "등록일자"],
+    "deadline": ["처리기한", "기한"],
+    "priority": ["비고", "중요도"],
+}
+TASK_TEMPLATE_HEADERS = ["업무제목", "등록일", "처리기한", "비고"]
+TASK_TEMPLATE_EXAMPLE_TITLE = "예시 업무 (이 행은 가져오기에서 제외됩니다)"
 
 
 def normalize_header(value: Any) -> str:
@@ -87,6 +98,63 @@ def read_workbook(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
     return frame, mapping
 
 
+def read_task_workbook(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix == ".xls":
+        try:
+            frame = pd.read_excel(path, engine="xlrd")
+        except ImportError as exc:
+            raise RuntimeError("구형 .xls 파일을 읽으려면 xlrd 모듈이 필요합니다.") from exc
+    elif suffix in {".xlsx", ".xlsm"}:
+        frame = pd.read_excel(path, engine="openpyxl")
+    else:
+        raise ValueError(".xls, .xlsx 또는 .xlsm 파일만 가져올 수 있습니다.")
+    frame = frame.dropna(how="all")
+    normalized = {normalize_header(column): column for column in frame.columns}
+    mapping: dict[str, Any] = {}
+    for field_name, aliases in TASK_ALIASES.items():
+        for alias in aliases:
+            key = normalize_header(alias)
+            if key in normalized:
+                mapping[field_name] = normalized[key]
+                break
+    missing = set(TASK_ALIASES) - set(mapping)
+    if missing:
+        labels = {key: TASK_ALIASES[key][0] for key in missing}
+        raise ValueError("필수 열을 찾지 못했습니다: " + ", ".join(labels.values()))
+    return frame, mapping
+
+
+def create_task_template(path: Path) -> None:
+    if path.suffix.lower() != ".xlsx":
+        path = path.with_suffix(".xlsx")
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "수시업무"
+    sheet.append(TASK_TEMPLATE_HEADERS)
+    sheet.append(
+        [
+            TASK_TEMPLATE_EXAMPLE_TITLE,
+            "2026-08-29",
+            "2026-09-05",
+            "날짜는 YYYY-MM-DD 형식으로 입력하세요.",
+        ]
+    )
+    fill = PatternFill("solid", fgColor="D8F0CD")
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+        cell.fill = fill
+    example_fill = PatternFill("solid", fgColor="FFF4CC")
+    for cell in sheet[2]:
+        cell.font = Font(italic=True, color="7A6320")
+        cell.fill = example_fill
+    for column, width in zip(("A", "B", "C", "D"), (32, 20, 20, 36)):
+        sheet.column_dimensions[column].width = width
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = "A1:D1"
+    workbook.save(path)
+
+
 @dataclass
 class ImportItem:
     row_number: int
@@ -129,6 +197,23 @@ def preview_import(path: Path, db: Database) -> list[ImportItem]:
     return items
 
 
+def preview_task_import(path: Path) -> list[ImportItem]:
+    frame, mapping = read_task_workbook(path)
+    items: list[ImportItem] = []
+    for index, row in frame.iterrows():
+        data: dict[str, str] = {}
+        for field_name, column in mapping.items():
+            raw = row[column]
+            if field_name in {"registered_at", "deadline"}:
+                data[field_name] = format_datetime(raw)
+            else:
+                data[field_name] = "" if pd.isna(raw) else str(raw)
+        if data.get("title") == TASK_TEMPLATE_EXAMPLE_TITLE:
+            continue
+        items.append(ImportItem(index + 2, "신규", "새 수시업무", data))
+    return items
+
+
 def apply_import(path: Path, db: Database, items: list[ImportItem]) -> dict[str, int]:
     counts = {"new": 0, "changed": 0, "skipped": 0, "error": 0}
     for item in items:
@@ -138,6 +223,27 @@ def apply_import(path: Path, db: Database, items: list[ImportItem]) -> dict[str,
         elif item.status == "변경" and item.existing_id:
             db.update_complaint_from_import(item.existing_id, item.data)
             counts["changed"] += 1
+        elif item.status == "오류":
+            counts["error"] += 1
+        else:
+            counts["skipped"] += 1
+    db.log_import(path.name, counts)
+    return counts
+
+
+def apply_task_import(
+    path: Path,
+    db: Database,
+    items: list[ImportItem],
+    processing_stage: str = "접수",
+) -> dict[str, int]:
+    counts = {"new": 0, "changed": 0, "skipped": 0, "error": 0}
+    for item in items:
+        if item.status == "신규":
+            data = dict(item.data)
+            data["processing_stage"] = processing_stage
+            db.add_task(data)
+            counts["new"] += 1
         elif item.status == "오류":
             counts["error"] += 1
         else:

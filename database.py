@@ -75,12 +75,22 @@ class Database:
                 registered_at TEXT NOT NULL,
                 deadline TEXT NOT NULL,
                 content_enc TEXT NOT NULL DEFAULT '',
-                priority TEXT NOT NULL DEFAULT '보통',
+                priority TEXT NOT NULL DEFAULT '',
                 processing_stage TEXT NOT NULL DEFAULT '접수',
                 progress_state TEXT NOT NULL DEFAULT '{}',
                 stage_config TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '진행',
                 completed_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS calendar_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_date TEXT NOT NULL,
+                event_time TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL,
+                details_enc TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -136,6 +146,9 @@ class Database:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN progress_state TEXT NOT NULL DEFAULT '{}'")
         if "stage_config" not in task_columns:
             self.conn.execute("ALTER TABLE tasks ADD COLUMN stage_config TEXT NOT NULL DEFAULT ''")
+        event_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(calendar_events)").fetchall()}
+        if "event_time" not in event_columns:
+            self.conn.execute("ALTER TABLE calendar_events ADD COLUMN event_time TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
 
     def _log_audit(self, kind: str, item_id: int, action: str, details: str = "") -> None:
@@ -359,7 +372,7 @@ class Database:
             (
                 data["title"], self._enc(data.get("applicant_name")),
                 self._enc(data.get("birth_date")), data["registered_at"], data["deadline"],
-                self._enc(data.get("content")), data.get("priority", "보통"),
+                self._enc(data.get("content")), data.get("priority", ""),
                 data.get("processing_stage", "접수"), now, now,
             ),
         )
@@ -383,10 +396,10 @@ class Database:
             """,
             (
                 data["title"], data["registered_at"], data["deadline"],
-                self._enc(data.get("content")), data.get("priority", "보통"), now, task_id,
+                self._enc(data.get("content")), data.get("priority", ""), now, task_id,
             ),
         )
-        self._log_audit("task", task_id, "수시업무 기본정보 수정", "업무 제목·등록일·처리기한·중요도·내용")
+        self._log_audit("task", task_id, "수시업무 기본정보 수정", "업무 제목·등록일·처리기한·비고·내용")
         self.conn.commit()
 
     def update_task_progress_state(self, task_id: int, state: dict[str, Any], processing_stage: str) -> None:
@@ -419,7 +432,7 @@ class Database:
                 self.conn.execute("UPDATE tasks SET deadline=?, updated_at=? WHERE id=?", (deadline, now, task_id))
             if priority:
                 self.conn.execute("UPDATE tasks SET priority=?, updated_at=? WHERE id=?", (priority, now, task_id))
-            changes = " · ".join(part for part in (f"처리기한 {deadline}" if deadline else "", f"중요도 {priority}" if priority else "") if part)
+            changes = " · ".join(part for part in (f"처리기한 {deadline}" if deadline else "", f"비고 {priority}" if priority else "") if part)
             if changes:
                 self._log_audit("task", task_id, "일괄 변경", changes)
         self.conn.commit()
@@ -546,6 +559,61 @@ class Database:
                 counts.get("changed", 0), counts.get("skipped", 0), counts.get("error", 0),
             ),
         )
+        self.conn.commit()
+
+    def add_calendar_event(self, event_date: str, title: str, details: str = "", event_time: str = "") -> int:
+        now = datetime.now().isoformat(timespec="seconds")
+        cursor = self.conn.execute(
+            "INSERT INTO calendar_events(event_date, event_time, title, details_enc, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+            (event_date, event_time, title, self._enc(details), now, now),
+        )
+        event_id = int(cursor.lastrowid)
+        self._log_audit("calendar_event", event_id, "일정 등록", event_date)
+        self.conn.commit()
+        return event_id
+
+    def list_calendar_events(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM calendar_events ORDER BY event_date, id"
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["details"] = self._dec(item.pop("details_enc"))
+            result.append(item)
+        return result
+
+    def calendar_event_by_id(self, event_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM calendar_events WHERE id=?", (event_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["details"] = self._dec(item.pop("details_enc"))
+        return item
+
+    def update_calendar_event(
+        self,
+        event_id: int,
+        event_date: str,
+        title: str,
+        details: str = "",
+        event_time: str = "",
+    ) -> None:
+        if not self.conn.execute("SELECT id FROM calendar_events WHERE id=?", (event_id,)).fetchone():
+            raise ValueError("수정할 일정을 찾을 수 없습니다.")
+        now = datetime.now().isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE calendar_events SET event_date=?, event_time=?, title=?, details_enc=?, updated_at=? WHERE id=?",
+            (event_date, event_time, title, self._enc(details), now, event_id),
+        )
+        self._log_audit("calendar_event", event_id, "일정 수정", f"{event_date} {event_time}".strip())
+        self.conn.commit()
+
+    def delete_calendar_event(self, event_id: int) -> None:
+        if not self.conn.execute("SELECT id FROM calendar_events WHERE id=?", (event_id,)).fetchone():
+            return
+        self._log_audit("calendar_event", event_id, "일정 삭제")
+        self.conn.execute("DELETE FROM calendar_events WHERE id=?", (event_id,))
         self.conn.commit()
 
     def backup(self) -> Path:

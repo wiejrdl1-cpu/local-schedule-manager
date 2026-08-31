@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 import os
 import sys
 import tempfile
@@ -8,10 +9,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
+from app import ScheduleApp
 from database import Database, RELEASE_APP_DIR_NAME, default_data_dir
-from excel_import import apply_import, preview_import
+from excel_import import (
+    TASK_TEMPLATE_EXAMPLE_TITLE,
+    TASK_TEMPLATE_HEADERS,
+    apply_import,
+    apply_task_import,
+    create_task_template,
+    preview_import,
+    preview_task_import,
+)
 
 
 class CoreFlowTests(unittest.TestCase):
@@ -231,6 +241,106 @@ class CoreFlowTests(unittest.TestCase):
         task = self.db.task_by_id(task_id)
         self.assertEqual(task["processing_stage"], "작업중")
         self.assertIn("task-received", task["progress_state"])
+
+    def test_task_excel_template_and_blank_values_are_preserved(self) -> None:
+        template = self.root / "수시업무_샘플.xlsx"
+        create_task_template(template)
+        workbook = load_workbook(template)
+        self.assertEqual([cell.value for cell in workbook.active[1]], TASK_TEMPLATE_HEADERS)
+        example = [cell.value for cell in workbook.active[2]]
+        self.assertEqual(example[0], TASK_TEMPLATE_EXAMPLE_TITLE)
+        self.assertEqual(example[1:3], ["2026-08-29", "2026-09-05"])
+        self.assertIn("YYYY-MM-DD", example[3])
+        self.assertEqual(preview_task_import(template), [])
+
+        path = self.root / "수시업무.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(TASK_TEMPLATE_HEADERS)
+        sheet.append(["공백 확인", "2026-08-20", None, "  앞뒤 공백 유지  "])
+        sheet.append([None, None, "2026-09-01", None])
+        workbook.save(path)
+
+        items = preview_task_import(path)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].data["deadline"], "")
+        self.assertEqual(items[0].data["priority"], "  앞뒤 공백 유지  ")
+        self.assertEqual(items[1].data["title"], "")
+        counts = apply_task_import(path, self.db, items, "접수")
+        self.assertEqual(counts["new"], 2)
+        tasks = self.db.list_tasks()
+        self.assertEqual(tasks[0]["priority"], "  앞뒤 공백 유지  ")
+        self.assertEqual(tasks[0]["deadline"], "")
+        self.assertEqual(tasks[1]["title"], "")
+
+    def test_calendar_event_details_are_saved_and_encrypted(self) -> None:
+        event_id = self.db.add_calendar_event("2026-08-29", "회의 일정", "가상의 상세 회의 내용", "14:30")
+        event = self.db.list_calendar_events()[0]
+        self.assertEqual(event["id"], event_id)
+        self.assertEqual(event["event_date"], "2026-08-29")
+        self.assertEqual(event["event_time"], "14:30")
+        self.assertEqual(event["title"], "회의 일정")
+        self.assertEqual(event["details"], "가상의 상세 회의 내용")
+
+        raw_conn = sqlite3.connect(self.db.path)
+        try:
+            encrypted_details = raw_conn.execute(
+                "SELECT details_enc FROM calendar_events WHERE id=?", (event_id,)
+            ).fetchone()[0]
+        finally:
+            raw_conn.close()
+        self.assertNotIn("가상의 상세 회의 내용", encrypted_details)
+
+        self.db.update_calendar_event(
+            event_id,
+            "2026-08-30",
+            "수정된 회의 일정",
+            "수정된 상세 내용",
+            "18:00",
+        )
+        updated = self.db.calendar_event_by_id(event_id)
+        self.assertEqual(updated["event_date"], "2026-08-30")
+        self.assertEqual(updated["event_time"], "18:00")
+        self.assertEqual(updated["title"], "수정된 회의 일정")
+        self.assertEqual(updated["details"], "수정된 상세 내용")
+
+        self.db.delete_calendar_event(event_id)
+        self.assertIsNone(self.db.calendar_event_by_id(event_id))
+
+    def test_task_progress_supports_detail_branches(self) -> None:
+        app = object.__new__(ScheduleApp)
+        app.task_stage_config = [
+            {"id": "received", "name": "접수", "branches": []},
+            {
+                "id": "working",
+                "name": "처리중",
+                "branches": [
+                    {"id": "review", "name": "검토"},
+                    {"id": "approval", "name": "결재"},
+                ],
+            },
+        ]
+        task = {
+            "stage_config": "",
+            "processing_stage": "처리중 > 결재",
+            "progress_state": json.dumps(
+                {"current": "b:working:approval", "completed": ["s:received", "b:working:review"]},
+                ensure_ascii=False,
+            ),
+        }
+        self.assertEqual(app._progress_node_keys(app.task_stage_config), ["s:received", "b:working:review", "b:working:approval"])
+        self.assertEqual(app._task_progress_state(task)["current"], "b:working:approval")
+        self.assertEqual(app._task_stage_text("b:working:approval"), "처리중 > 결재")
+
+        app.db = self.db
+        app.refresh_all = lambda: None
+        task_id = self.db.add_task(
+            {"title": "분기 처리", "registered_at": "2026-08-20", "deadline": "2026-09-10", "processing_stage": "접수"}
+        )
+        app._toggle_task_progress(task_id, "b:working:review", True)
+        updated = self.db.task_by_id(task_id)
+        self.assertEqual(updated["processing_stage"], "처리중 > 결재")
+        self.assertIn("b:working:review", updated["progress_state"])
 
 
 if __name__ == "__main__":

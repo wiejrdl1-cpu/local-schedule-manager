@@ -1,4 +1,5 @@
 cryptography>=42.0
+holidays>=0.60
 openpyxl>=3.1
 pandas>=2.2
 xlrd>=2.0.2

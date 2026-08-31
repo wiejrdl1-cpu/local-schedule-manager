@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import secrets
@@ -12,8 +13,17 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 from typing import Callable
 
+import holidays
+
 from database import Database
-from excel_import import ImportItem, apply_import, preview_import
+from excel_import import (
+    ImportItem,
+    apply_import,
+    apply_task_import,
+    create_task_template,
+    preview_import,
+    preview_task_import,
+)
 from notifications import show_windows_notification
 from security import InvalidPasswordError
 
@@ -38,9 +48,9 @@ DEFAULT_STAGES = [
     {"id": "investigation-complete", "name": "조사완료", "branches": []},
 ]
 DEFAULT_TASK_STAGES = [
-    {"id": "task-received", "name": "접수"},
-    {"id": "task-working", "name": "작업중"},
-    {"id": "task-complete", "name": "완료"},
+    {"id": "task-received", "name": "접수", "branches": []},
+    {"id": "task-working", "name": "작업중", "branches": []},
+    {"id": "task-complete", "name": "완료", "branches": []},
 ]
 PROGRESS_COLORS = {"completed": "#E34F4F", "current": "#3E82D7", "pending": "#C9CECA"}
 
@@ -115,12 +125,9 @@ class FormDialog(tk.Toplevel):
         body.columnconfigure(1, weight=1)
         for row, (key, label, default) in enumerate(fields):
             ttk.Label(body, text=label).grid(row=row, column=0, sticky="nw", padx=(0, 12), pady=6)
-            if key in {"memo", "content", "reason"}:
-                widget = tk.Text(body, width=46, height=4, wrap="word")
+            if key in {"memo", "content", "reason", "details"}:
+                widget = tk.Text(body, width=46, height=4, wrap="word", font=getattr(parent, "input_font", None))
                 widget.insert("1.0", default)
-            elif key == "priority":
-                widget = ttk.Combobox(body, values=("낮음", "보통", "높음", "긴급"), state="readonly", width=43)
-                widget.set(default or "보통")
             else:
                 widget = ttk.Entry(body, width=46)
                 widget.insert(0, default)
@@ -160,6 +167,9 @@ class ScheduleApp(tk.Tk):
         self.import_items: list[ImportItem] = []
         self.stage_config = self._load_stage_config()
         self.task_stage_config = self._load_task_stage_config()
+        today = date.today()
+        self.calendar_month = today.replace(day=1)
+        self.calendar_selected_date = today
         self._progress_canvases: list[tk.Canvas] = []
         self._complaint_progress_buttons: list[ttk.Button] = []
         self._complaint_progress: dict[str, tuple[dict[str, object], str]] = {}
@@ -189,12 +199,50 @@ class ScheduleApp(tk.Tk):
             (name for name in ("NanumGothic", "나눔고딕", "Arial Rounded MT Bold", "맑은 고딕") if name in installed_fonts),
             "맑은 고딕",
         )
-        self.option_add("*Font", f"{{{self.ui_font}}} 11 bold")
+        self.input_font = tkfont.Font(self, family=self.ui_font, size=10, weight="normal")
+        for named_font in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
+            try:
+                tkfont.nametofont(named_font, root=self).configure(
+                    family=self.ui_font,
+                    size=10,
+                    weight="normal",
+                )
+            except tk.TclError:
+                pass
+        self.option_add("*Font", self.input_font)
+        self.option_add("*Entry.font", self.input_font)
+        self.option_add("*Text.font", self.input_font)
+        self.option_add("*Text.borderWidth", 1)
+        self.option_add("*Text.relief", "solid")
+        self.option_add("*Text.highlightThickness", 1)
+        self.option_add("*Text.highlightBackground", "#879987")
+        self.option_add("*Text.highlightColor", PALETTE["green_dark"])
+        self.option_add("*TCombobox*Listbox.font", self.input_font)
         self.configure(background=PALETTE["background"])
         style.configure("TFrame", background=PALETTE["background"])
         style.configure("TLabel", font=(self.ui_font, 11, "bold"), background=PALETTE["background"], foreground=PALETTE["text"])
-        style.configure("TEntry", font=(self.ui_font, 9))
-        style.configure("TCombobox", font=(self.ui_font, 9))
+        style.configure(
+            "TEntry",
+            font=self.input_font,
+            fieldbackground="#FFFFFF",
+            borderwidth=1,
+            relief="solid",
+            bordercolor="#879987",
+            lightcolor="#879987",
+            darkcolor="#879987",
+        )
+        style.map("TEntry", bordercolor=[("focus", PALETTE["green_dark"])])
+        style.configure(
+            "TCombobox",
+            font=self.input_font,
+            fieldbackground="#FFFFFF",
+            borderwidth=1,
+            relief="solid",
+            bordercolor="#879987",
+            lightcolor="#879987",
+            darkcolor="#879987",
+        )
+        style.map("TCombobox", bordercolor=[("focus", PALETTE["green_dark"])])
         style.configure("TCheckbutton", font=(self.ui_font, 10, "bold"), background=PALETTE["background"], foreground=PALETTE["text"])
         style.configure("TRadiobutton", font=(self.ui_font, 10, "bold"), background=PALETTE["background"], foreground=PALETTE["text"])
         style.configure("TLabelframe", background=PALETTE["surface"], bordercolor=PALETTE["border"])
@@ -211,6 +259,7 @@ class ScheduleApp(tk.Tk):
         style.map("TButton", background=[("active", PALETTE["background"]), ("pressed", PALETTE["background"])], foreground=[("active", "#111111")])
         style.configure("Accent.TButton", font=(self.ui_font, 9, "bold"), background=PALETTE["background"], foreground="#111111", bordercolor=PALETTE["border"])
         style.map("Accent.TButton", background=[("active", PALETTE["background"]), ("pressed", PALETTE["background"])], foreground=[("active", "#111111")])
+        style.configure("ExcelAction.TButton", font=(self.ui_font, 10, "bold"), padding=(10, 6))
         style.configure("Edit.TButton", font=(self.ui_font, 10, "bold"), background=PALETTE["background"], foreground="#111111", bordercolor=PALETTE["border"])
         style.map("Edit.TButton", background=[("active", PALETTE["background"]), ("pressed", PALETTE["background"])], foreground=[("active", "#111111")])
         style.configure("SelectedEdit.TButton", font=(self.ui_font, 10, "bold"), background="#A9DDA4", foreground="#173B23", bordercolor="#71906F")
@@ -225,6 +274,9 @@ class ScheduleApp(tk.Tk):
         style.map("Treeview", background=[("selected", "#A9DDA4")], foreground=[("selected", "#173B23")])
         style.configure("Treeview.Heading", font=(self.ui_font, 9, "bold"), background=PALETTE["green_soft"], foreground=PALETTE["green_dark"], bordercolor="#D9E5D6")
         style.map("Treeview.Heading", background=[("active", "#C4E7B9")])
+        style.configure("Calendar.Treeview", rowheight=34, font=(self.ui_font, 9), background="#FFFFFF", fieldbackground="#FFFFFF", foreground=PALETTE["text"], bordercolor="#B8C9B5", borderwidth=1)
+        style.map("Calendar.Treeview", background=[("selected", "#A9DDA4")], foreground=[("selected", "#173B23")])
+        style.configure("Calendar.Treeview.Heading", font=(self.ui_font, 9, "bold"), background=PALETTE["green_soft"], foreground=PALETTE["green_dark"])
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=(22, 18))
@@ -232,6 +284,7 @@ class ScheduleApp(tk.Tk):
         header = ttk.Frame(root)
         header.pack(fill="x")
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="© 2026 이주삼", style="Subtitle.TLabel").pack(side="right", anchor="ne")
 
         self.summary_vars = {key: tk.StringVar(value="0") for key in ("민원", "수시업무", "오늘 마감", "3일 이내", "기한 초과")}
         cards = ttk.Frame(root)
@@ -279,12 +332,14 @@ class ScheduleApp(tk.Tk):
         self.today_tab = ttk.Frame(self.notebook, padding=12)
         self.complaints_tab = ttk.Frame(self.notebook, padding=12)
         self.tasks_tab = ttk.Frame(self.notebook, padding=12)
+        self.calendar_tab = ttk.Frame(self.notebook, padding=12)
         self.completed_tab = ttk.Frame(self.notebook, padding=12)
         self.trash_tab = ttk.Frame(self.notebook, padding=12)
         pages = (
             (self.today_tab, "오늘의 업무"),
-            (self.complaints_tab, "민원 신청 처리"),
-            (self.tasks_tab, "수시업무"),
+            (self.complaints_tab, "새올 민원 처리"),
+            (self.tasks_tab, "수시업무 처리"),
+            (self.calendar_tab, "월간 일정"),
             (self.completed_tab, "완료 내역"),
             (self.trash_tab, "휴지통"),
         )
@@ -303,6 +358,7 @@ class ScheduleApp(tk.Tk):
         self._build_today_tab()
         self._build_complaints_tab()
         self._build_tasks_tab()
+        self._build_calendar_tab()
         self._build_completed_tab()
         self._build_trash_tab()
         self.show_page(0)
@@ -354,7 +410,7 @@ class ScheduleApp(tk.Tk):
             json.dumps(self.stage_config, ensure_ascii=False),
         )
 
-    def _load_task_stage_config(self) -> list[dict[str, str]]:
+    def _load_task_stage_config(self) -> list[dict[str, object]]:
         raw = self.db.get_setting("task_stage_config")
         if raw:
             try:
@@ -365,6 +421,19 @@ class ScheduleApp(tk.Tk):
                         if not stage.get("id"):
                             stage["id"] = uuid.uuid4().hex
                             changed = True
+                        normalized_branches = []
+                        for branch in stage.get("branches", []):
+                            if isinstance(branch, str):
+                                normalized_branches.append({"id": uuid.uuid4().hex, "name": branch})
+                                changed = True
+                            else:
+                                if not branch.get("id"):
+                                    branch["id"] = uuid.uuid4().hex
+                                    changed = True
+                                normalized_branches.append(branch)
+                        if stage.get("branches") != normalized_branches:
+                            changed = True
+                        stage["branches"] = normalized_branches
                     if changed:
                         self.db.set_setting("task_stage_config", json.dumps(loaded, ensure_ascii=False))
                     return loaded
@@ -398,21 +467,28 @@ class ScheduleApp(tk.Tk):
             state = json.loads(str(task.get("progress_state") or "{}"))
         except json.JSONDecodeError:
             state = {}
-        valid = {f"s:{stage['id']}" for stage in stages}
+        valid = set(self._progress_node_keys(stages))
         if state.get("current") in valid:
-            return {"current": state["current"], "completed": list(state.get("completed", []))}
+            completed = [key for key in state.get("completed", []) if key in valid]
+            return {"current": state["current"], "completed": completed}
         stage_text = str(task.get("processing_stage", ""))
         index = next((i for i, stage in enumerate(stages) if str(stage["name"]) in stage_text), 0)
+        stage = stages[index]
+        branches = stage.get("branches", [])
+        current = f"b:{stage['id']}:{branches[0]['id']}" if branches else f"s:{stage['id']}"
+        for branch in branches:
+            if str(branch["name"]) in stage_text:
+                current = f"b:{stage['id']}:{branch['id']}"
+                break
+        previous = self._progress_node_keys(stages[:index])
         return {
-            "current": f"s:{stages[index]['id']}",
-            "completed": [f"s:{stage['id']}" for stage in stages[:index]],
+            "current": current,
+            "completed": previous,
         }
 
     def _task_stage_text(self, key: str, stages: list[dict[str, object]] | None = None) -> str:
         stages = stages or self.task_stage_config
-        stage_id = key.split(":", 1)[1] if ":" in key else ""
-        stage = next((item for item in stages if str(item["id"]) == stage_id), stages[0])
-        return str(stage["name"])
+        return self._definition_text_from_key(key, stages)
 
     def _toggle_task_progress(self, task_id: int, node_key: str, is_completed: bool) -> None:
         task = self.db.task_by_id(task_id)
@@ -420,7 +496,7 @@ class ScheduleApp(tk.Tk):
             return
         stages = self._task_stages(task)
         state = self._task_progress_state(task)
-        nodes = [f"s:{stage['id']}" for stage in stages]
+        nodes = self._progress_node_keys(stages)
         if node_key not in nodes:
             return
         completed = set(state.get("completed", []))
@@ -500,7 +576,8 @@ class ScheduleApp(tk.Tk):
         return text
 
     def _progress_node_keys(self, stages: list[dict[str, object]] | None = None) -> list[str]:
-        stages = stages or self.stage_config
+        if stages is None:
+            stages = self.stage_config
         keys = []
         for stage in stages:
             branches = stage.get("branches", [])
@@ -519,8 +596,8 @@ class ScheduleApp(tk.Tk):
         ordered_nodes = self._progress_node_keys(stages)
         if node_key not in ordered_nodes:
             return
-        completed = set(state.get("completed", []))
         selected_index = ordered_nodes.index(node_key)
+        completed = set(state.get("completed", []))
         if is_completed:
             completed.update(ordered_nodes[: selected_index + 1])
             pending = [key for key in ordered_nodes if key not in completed]
@@ -528,10 +605,9 @@ class ScheduleApp(tk.Tk):
         else:
             completed.difference_update(ordered_nodes[selected_index:])
             current_key = node_key
-        new_state = {"current": current_key, "completed": sorted(completed)}
         self.db.update_progress_state(
             complaint_id,
-            new_state,
+            {"current": current_key, "completed": sorted(completed)},
             self._definition_text_from_key(current_key, stages),
         )
         self.refresh_all()
@@ -668,20 +744,45 @@ class ScheduleApp(tk.Tk):
             start_x = max(4, (width - total_width) // 2)
             for index, stage in enumerate(stages):
                 key = f"s:{stage['id']}"
-                status = "completed" if key in completed else "current" if key == current else "pending"
+                branches = stage.get("branches", [])
+                branch_keys = [f"b:{stage['id']}:{branch['id']}" for branch in branches]
+                branch_current = current.startswith(f"b:{stage['id']}:")
+                stage_completed = key in completed or bool(branch_keys) and all(branch_key in completed for branch_key in branch_keys)
+                status = "completed" if stage_completed else "current" if key == current or branch_current else "pending"
                 left = start_x + index * (stage_width + gap)
-                canvas.create_rectangle(left, 8, left + stage_width, 32, fill=PROGRESS_COLORS[status], outline="")
-                canvas.create_text(left + stage_width / 2, 20, text=str(stage["name"]), fill="#FFFFFF" if status != "pending" else "#4D554F", font=(self.ui_font, 9, "bold"))
-                checked = tk.BooleanVar(value=key in completed)
-                check = tk.Checkbutton(
-                    canvas,
-                    variable=checked,
-                    background=background,
-                    activebackground=background,
-                    selectcolor="#FFFFFF",
-                    command=lambda task_id=int(task["id"]), node=key, variable=checked: self._toggle_task_progress(task_id, node, variable.get()),
-                )
-                canvas.create_window(left + stage_width / 2, 50, window=check)
+                canvas.create_rectangle(left, 4, left + stage_width, 25, fill=PROGRESS_COLORS[status], outline="")
+                canvas.create_text(left + stage_width / 2, 14, text=str(stage["name"]), fill="#FFFFFF" if status != "pending" else "#4D554F", font=(self.ui_font, 8, "bold"))
+                if branches:
+                    canvas.create_line(left + stage_width / 2, 25, left + stage_width / 2, 30, fill="#879188")
+                    branch_width = max(8, (stage_width - 2 * (len(branches) - 1)) // len(branches))
+                    for branch_index, branch in enumerate(branches):
+                        branch_key = f"b:{stage['id']}:{branch['id']}"
+                        branch_status = "completed" if branch_key in completed else "current" if current == branch_key else "pending"
+                        branch_left = left + branch_index * (branch_width + 2)
+                        canvas.create_rectangle(branch_left, 30, branch_left + branch_width, 45, fill=PROGRESS_COLORS[branch_status], outline="")
+                        if branch_width >= 35:
+                            canvas.create_text(branch_left + branch_width / 2, 37, text=str(branch["name"]), fill="#FFFFFF" if branch_status != "pending" else "#4D554F", font=(self.ui_font, 7, "bold"))
+                        checked = tk.BooleanVar(value=branch_key in completed)
+                        check = tk.Checkbutton(
+                            canvas,
+                            variable=checked,
+                            background=background,
+                            activebackground=background,
+                            selectcolor="#FFFFFF",
+                            command=lambda task_id=int(task["id"]), node=branch_key, variable=checked: self._toggle_task_progress(task_id, node, variable.get()),
+                        )
+                        canvas.create_window(branch_left + branch_width / 2, 57, window=check)
+                else:
+                    checked = tk.BooleanVar(value=key in completed)
+                    check = tk.Checkbutton(
+                        canvas,
+                        variable=checked,
+                        background=background,
+                        activebackground=background,
+                        selectcolor="#FFFFFF",
+                        command=lambda task_id=int(task["id"]), node=key, variable=checked: self._toggle_task_progress(task_id, node, variable.get()),
+                    )
+                    canvas.create_window(left + stage_width / 2, 51, window=check)
             canvas.bind("<Button-1>", lambda event, row_id=iid: self._select_tree_row(self.task_tree, row_id, event))
             canvas.bind("<Double-1>", lambda _e, row_id=iid: (self.task_tree.selection_set(row_id), self.edit_task_dialog()))
             edit_bounds = self.task_tree.bbox(iid, "progress_edit")
@@ -965,13 +1066,14 @@ class ScheduleApp(tk.Tk):
         entry.bind("<KeyRelease>", lambda _e: self.refresh_tasks())
         ttk.Label(bar, text="※ Ctrl+클릭 또는 Shift+클릭으로 여러 항목을 선택할 수 있습니다.", style="Subtitle.TLabel").pack(side="left")
         self.task_quick_filter = tk.StringVar(value="전체")
-        task_filter = ttk.Combobox(bar, textvariable=self.task_quick_filter, values=("전체", "오늘 마감", "3일 이내", "이번 주", "기한 초과", "높음·긴급"), state="readonly", width=12)
+        task_filter = ttk.Combobox(bar, textvariable=self.task_quick_filter, values=("전체", "오늘 마감", "3일 이내", "이번 주", "기한 초과"), state="readonly", width=12)
         task_filter.pack(side="right")
         ttk.Label(bar, text="빠른 필터").pack(side="right", padx=(0, 7))
         task_filter.bind("<<ComboboxSelected>>", lambda _event: self.refresh_tasks())
         actions = ttk.Frame(self.tasks_tab)
         actions.pack(fill="x", pady=(0, 10))
         ttk.Button(actions, text="수시업무 등록", style="Accent.TButton", command=self.add_task_dialog).pack(side="left")
+        ttk.Button(actions, text="엑셀로 가져오기", command=self.open_task_excel_import).pack(side="left", padx=6)
         ttk.Button(actions, text="선택 항목 일괄 변경", style="Accent.TButton", command=lambda: self.open_bulk_change_dialog("task")).pack(side="left", padx=6)
         ttk.Button(actions, text="변경 이력", command=lambda: self.show_audit_history("task")).pack(side="left")
         right_actions = ttk.Frame(actions)
@@ -982,10 +1084,135 @@ class ScheduleApp(tk.Tk):
         self.task_tree = self._new_tree(
             self.tasks_tab,
             ("title", "registered", "deadline", "dday", "priority", "progress", "progress_edit"),
-            ("업무 제목", "등록일", "처리기한", "남은 기간", "중요도", "진행 현황", "진행 현황 수정"),
+            ("업무 제목", "등록일", "처리기한", "남은 기간", "비고", "진행 현황", "진행 현황 수정"),
             (280, 110, 140, 90, 90, 390, 120),
         )
         self.task_tree.bind("<Double-1>", self.edit_task_dialog)
+
+    def _build_calendar_tab(self) -> None:
+        toolbar = self._toolbar(self.calendar_tab)
+        ttk.Button(toolbar, text="◀ 이전 달", command=lambda: self.change_calendar_month(-1)).pack(side="left")
+        self.calendar_month_var = tk.StringVar()
+        ttk.Label(toolbar, textvariable=self.calendar_month_var, style="Title.TLabel").pack(side="left", padx=18)
+        ttk.Button(toolbar, text="다음 달 ▶", command=lambda: self.change_calendar_month(1)).pack(side="left")
+        ttk.Button(toolbar, text="오늘", style="Accent.TButton", command=self.go_calendar_today).pack(side="left", padx=8)
+
+        self.calendar_filter = tk.StringVar(value="전체")
+        filter_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.calendar_filter,
+            values=("전체", "새올 민원", "수시업무", "일정"),
+            state="readonly",
+            width=12,
+        )
+        filter_box.pack(side="right")
+        ttk.Label(toolbar, text="업무 구분").pack(side="right", padx=(0, 7))
+        filter_box.bind("<<ComboboxSelected>>", lambda _event: self.refresh_calendar())
+
+        ttk.Label(
+            self.calendar_tab,
+            text="날짜를 한 번 누르면 상세 목록을 보고, 날짜를 더블클릭하면 새 일정을 등록할 수 있습니다.",
+            style="Subtitle.TLabel",
+        ).pack(anchor="w", pady=(0, 8))
+
+        content = ttk.Frame(self.calendar_tab)
+        content.pack(fill="both", expand=True)
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=0, minsize=470)
+        content.rowconfigure(0, weight=1)
+        calendar_panel = ttk.Frame(content)
+        calendar_panel.grid(row=0, column=0, sticky="nsew")
+        detail_panel = ttk.LabelFrame(content, text="전체 일정 요약", padding=10)
+        detail_panel.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        detail_panel.columnconfigure(0, weight=1)
+        detail_panel.rowconfigure(1, weight=1)
+
+        weekday_row = ttk.Frame(calendar_panel)
+        weekday_row.pack(fill="x")
+        for column, weekday in enumerate(("월", "화", "수", "목", "금", "토", "일")):
+            foreground = "#3478C5" if column == 5 else "#D74343" if column == 6 else PALETTE["green_dark"]
+            label = tk.Label(
+                weekday_row,
+                text=weekday,
+                font=(self.ui_font, 10, "bold"),
+                foreground=foreground,
+                background=PALETTE["green_soft"],
+                pady=6,
+            )
+            label.grid(row=0, column=column, sticky="ew", padx=1)
+            weekday_row.columnconfigure(column, weight=1)
+
+        self.calendar_days_frame = ttk.Frame(calendar_panel)
+        self.calendar_days_frame.pack(fill="both", expand=True, pady=(4, 0))
+        for column in range(7):
+            self.calendar_days_frame.columnconfigure(column, weight=1, uniform="calendar-column")
+
+        self.calendar_selected_var = tk.StringVar()
+        summary_header = ttk.Frame(detail_panel)
+        summary_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(summary_header, textvariable=self.calendar_selected_var, style="Subtitle.TLabel", wraplength=260).pack(side="left")
+        ttk.Button(summary_header, text="삭제", command=self.delete_selected_calendar_item).pack(side="right")
+        ttk.Button(summary_header, text="수정", style="Accent.TButton", command=self.edit_selected_calendar_item).pack(side="right", padx=(0, 6))
+
+        calendar_list_panel = ttk.Frame(detail_panel)
+        calendar_list_panel.grid(row=1, column=0, sticky="nsew")
+        self.calendar_day_tree = self._new_calendar_tree(
+            calendar_list_panel,
+            ("kind", "title", "time"),
+            ("구분", "제목", "시간"),
+            (75, 230, 110),
+            height=7,
+        )
+        self.calendar_day_tree.bind("<<TreeviewSelect>>", lambda _event: self.show_calendar_detail())
+        self.calendar_day_tree.bind(
+            "<Double-1>",
+            lambda event: self.open_calendar_item(self.calendar_day_tree, event),
+        )
+        self.calendar_day_tree.tag_configure("complaint", foreground="#8A4DBF")
+        self.calendar_day_tree.tag_configure("task", foreground="#3478C5")
+        self.calendar_day_tree.tag_configure("event", foreground="#202020")
+
+        self.calendar_detail_frame = ttk.LabelFrame(detail_panel, text="일정 상세", padding=10)
+        self.calendar_detail_frame.configure(height=170)
+        self.calendar_detail_frame.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.calendar_detail_frame.pack_propagate(False)
+        self.calendar_detail_title_var = tk.StringVar(value="목록에서 항목을 선택하세요.")
+        self.calendar_detail_var = tk.StringVar(value="")
+        ttk.Label(self.calendar_detail_frame, textvariable=self.calendar_detail_title_var).pack(anchor="w")
+        ttk.Label(
+            self.calendar_detail_frame,
+            textvariable=self.calendar_detail_var,
+            style="Subtitle.TLabel",
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(6, 0))
+
+    def _new_calendar_tree(
+        self,
+        parent: tk.Misc,
+        columns: tuple[str, ...],
+        headings: tuple[str, ...],
+        widths: tuple[int, ...],
+        height: int,
+    ) -> ttk.Treeview:
+        container = ttk.Frame(parent)
+        container.pack(fill="both", expand=True)
+        tree = ttk.Treeview(
+            container,
+            columns=columns,
+            show="headings",
+            style="Calendar.Treeview",
+            selectmode="browse",
+            height=height,
+        )
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        for column, heading, width in zip(columns, headings, widths):
+            tree.heading(column, text=heading)
+            tree.column(column, width=width, minwidth=60, anchor="center" if column in {"kind", "deadline", "dday"} else "w")
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        return tree
 
     def _build_completed_tab(self) -> None:
         bar = self._toolbar(self.completed_tab)
@@ -1024,7 +1251,7 @@ class ScheduleApp(tk.Tk):
             ("applicant_name", "민원인 성명", ""),
             ("birth_date", "생년월일", ""), ("received_at", "받은일자 *", today),
             ("registered_at", "접수일자", today), ("deadline", f"처리기한 * ({DATE_HINT})", today),
-            ("intake_type", "접수구분", "수기"), ("assignee", "담당자", ""), ("memo", "메모", ""),
+            ("memo", "메모", ""),
         ]
 
         def save(data: dict[str, str]) -> None:
@@ -1043,7 +1270,7 @@ class ScheduleApp(tk.Tk):
         today = date.today().isoformat()
         fields = [
             ("title", "업무 제목 *", ""), ("registered_at", "등록일 *", today),
-            ("deadline", f"처리기한 * ({DATE_HINT})", today), ("priority", "중요도", "보통"),
+            ("deadline", f"처리기한 * ({DATE_HINT})", today), ("priority", "비고", ""),
             ("content", "업무 내용", ""),
         ]
 
@@ -1105,7 +1332,7 @@ class ScheduleApp(tk.Tk):
             row += 1
 
         ttk.Label(body, text="메모").grid(row=row, column=0, sticky="nw", padx=(0, 12), pady=5)
-        memo = tk.Text(body, height=5, wrap="word", font=(self.ui_font, 9))
+        memo = tk.Text(body, height=5, wrap="word", font=self.input_font)
         memo.insert("1.0", complaint.get("memo", ""))
         memo.grid(row=row, column=1, sticky="nsew", pady=5)
         body.rowconfigure(row, weight=1)
@@ -1159,7 +1386,7 @@ class ScheduleApp(tk.Tk):
             ("title", "업무 제목 *", task["title"]),
             ("registered_at", "등록일 *", task["registered_at"]),
             ("deadline", f"처리기한 * ({DATE_HINT})", task["deadline"]),
-            ("priority", "중요도", task["priority"]),
+            ("priority", "비고", task["priority"]),
             ("content", "업무 내용", task["content"]),
         ]
 
@@ -1180,16 +1407,15 @@ class ScheduleApp(tk.Tk):
                 return
             nodes = self._progress_node_keys()
             state = self._progress_state(item)
-            title = str(item["complaint_name"])
             node_text = self._definition_text_from_key
         else:
             item = self.db.task_by_id(item_id)
             if not item:
                 return
-            nodes = [f"s:{stage['id']}" for stage in self.task_stage_config]
+            stages = self._task_stages(item)
+            nodes = self._progress_node_keys(stages)
             state = self._task_progress_state(item)
-            title = str(item["title"])
-            node_text = self._task_stage_text
+            node_text = lambda key: self._task_stage_text(key, stages)
 
         completed = set(state.get("completed", []))
         window = tk.Toplevel(self)
@@ -1202,12 +1428,11 @@ class ScheduleApp(tk.Tk):
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="진행 현황 수정", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(body, text=title, style="Subtitle.TLabel").pack(anchor="w", pady=(2, 4))
         ttk.Label(
             body,
             text="완료된 단계에 체크하세요. 뒤 단계를 체크하면 앞 단계도 함께 완료됩니다.",
             style="Subtitle.TLabel",
-        ).pack(anchor="w", pady=(0, 12))
+        ).pack(anchor="w", pady=(2, 12))
 
         list_frame = ttk.Frame(body)
         list_frame.pack(fill="both", expand=True)
@@ -1463,7 +1688,7 @@ class ScheduleApp(tk.Tk):
         edit_row.pack(fill="x")
         ttk.Label(edit_row, text="바꿀 이름").pack(side="left", padx=(0, 8))
         edit_var = tk.StringVar()
-        edit_entry = ttk.Entry(edit_row, textvariable=edit_var, font=(self.ui_font, 11, "bold"))
+        edit_entry = ttk.Entry(edit_row, textvariable=edit_var, font=self.input_font)
         edit_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(edit_row, text="이름 수정 적용", style="Accent.TButton", command=lambda: apply_name_edit()).pack(side="left", padx=(8, 0))
 
@@ -1630,7 +1855,7 @@ class ScheduleApp(tk.Tk):
         edit_row.pack(fill="x")
         ttk.Label(edit_row, text="바꿀 이름").pack(side="left", padx=(0, 8))
         edit_var = tk.StringVar()
-        edit_entry = ttk.Entry(edit_row, textvariable=edit_var, font=(self.ui_font, 11, "bold"))
+        edit_entry = ttk.Entry(edit_row, textvariable=edit_var, font=self.input_font)
         edit_entry.pack(side="left", fill="x", expand=True)
         ttk.Button(edit_row, text="이름 수정 적용", style="Accent.TButton", command=lambda: apply_name_edit()).pack(side="left", padx=(8, 0))
 
@@ -1732,19 +1957,16 @@ class ScheduleApp(tk.Tk):
             if not item:
                 return
             config = self._complaint_stages(item)
-            title = str(item["complaint_name"])
         else:
             item = self.db.task_by_id(item_id)
             if not item:
                 return
             config = self._task_stages(item)
-            title = str(item["title"])
         self._open_inline_stage_editor(
             task_mode=kind == "task",
             item_kind=kind,
             item_id=item_id,
             initial_config=config,
-            item_title=title,
         )
 
     def _open_inline_stage_editor(
@@ -1753,7 +1975,6 @@ class ScheduleApp(tk.Tk):
         item_kind: str | None = None,
         item_id: int | None = None,
         initial_config: list[dict[str, object]] | None = None,
-        item_title: str = "",
     ) -> None:
         config = initial_config or (self.task_stage_config if task_mode else self.stage_config)
         working = json.loads(json.dumps(config, ensure_ascii=False))
@@ -1771,8 +1992,6 @@ class ScheduleApp(tk.Tk):
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text=window.title(), style="Title.TLabel").pack(anchor="w")
-        if item_title:
-            ttk.Label(body, text=item_title, style="Subtitle.TLabel").pack(anchor="w", pady=(2, 0))
         ttk.Label(
             body,
             text=("이 단계 구성은 선택한 업무에만 적용되며 변경 내용은 자동 저장됩니다."
@@ -1807,9 +2026,7 @@ class ScheduleApp(tk.Tk):
             persist()
 
         def add_stage() -> None:
-            stage: dict[str, object] = {"id": uuid.uuid4().hex, "name": "새 단계"}
-            if not task_mode:
-                stage["branches"] = []
+            stage: dict[str, object] = {"id": uuid.uuid4().hex, "name": "새 단계", "branches": []}
             working.append(stage)
             persist()
             redraw()
@@ -1851,29 +2068,28 @@ class ScheduleApp(tk.Tk):
                 header.pack(fill="x")
                 ttk.Label(header, text="단계 이름").pack(side="left", padx=(0, 8))
                 stage_var = tk.StringVar(value=str(stage.get("name", "")))
-                stage_entry = ttk.Entry(header, textvariable=stage_var, font=(self.ui_font, 11, "bold"))
+                stage_entry = ttk.Entry(header, textvariable=stage_var, font=self.input_font)
                 stage_entry.pack(side="left", fill="x", expand=True)
                 stage_var.trace_add("write", lambda *_args, item=stage, variable=stage_var: update_name(item, variable))
                 ttk.Button(header, text="단계 삭제", command=lambda index=stage_index: delete_stage(index)).pack(side="right", padx=(8, 0))
                 ttk.Button(header, text="▼", width=3, command=lambda index=stage_index: move_stage(index, 1)).pack(side="right", padx=(4, 0))
                 ttk.Button(header, text="▲", width=3, command=lambda index=stage_index: move_stage(index, -1)).pack(side="right", padx=(8, 0))
 
-                if not task_mode:
-                    branches = stage.setdefault("branches", [])
-                    for branch_index, branch in enumerate(branches):
-                        branch_row = ttk.Frame(panel)
-                        branch_row.pack(fill="x", padx=(36, 0), pady=(7, 0))
-                        ttk.Label(branch_row, text=f"{stage_index + 1}-{branch_index + 1}").pack(side="left", padx=(0, 8))
-                        branch_var = tk.StringVar(value=str(branch.get("name", "")))
-                        branch_entry = ttk.Entry(branch_row, textvariable=branch_var, font=(self.ui_font, 10, "bold"))
-                        branch_entry.pack(side="left", fill="x", expand=True)
-                        branch_var.trace_add("write", lambda *_args, item=branch, variable=branch_var: update_name(item, variable))
-                        ttk.Button(
-                            branch_row,
-                            text="분기 삭제",
-                            command=lambda si=stage_index, bi=branch_index: delete_branch(si, bi),
-                        ).pack(side="right", padx=(8, 0))
-                    ttk.Button(panel, text="+ 세부 분기 추가", command=lambda index=stage_index: add_branch(index)).pack(anchor="w", padx=(36, 0), pady=(9, 0))
+                branches = stage.setdefault("branches", [])
+                for branch_index, branch in enumerate(branches):
+                    branch_row = ttk.Frame(panel)
+                    branch_row.pack(fill="x", padx=(36, 0), pady=(7, 0))
+                    ttk.Label(branch_row, text=f"{stage_index + 1}-{branch_index + 1}").pack(side="left", padx=(0, 8))
+                    branch_var = tk.StringVar(value=str(branch.get("name", "")))
+                    branch_entry = ttk.Entry(branch_row, textvariable=branch_var, font=self.input_font)
+                    branch_entry.pack(side="left", fill="x", expand=True)
+                    branch_var.trace_add("write", lambda *_args, item=branch, variable=branch_var: update_name(item, variable))
+                    ttk.Button(
+                        branch_row,
+                        text="분기 삭제",
+                        command=lambda si=stage_index, bi=branch_index: delete_branch(si, bi),
+                    ).pack(side="right", padx=(8, 0))
+                ttk.Button(panel, text="+ 세부 분기 추가", command=lambda index=stage_index: add_branch(index)).pack(anchor="w", padx=(36, 0), pady=(9, 0))
 
         def close_editor() -> None:
             persist()
@@ -1915,7 +2131,7 @@ class ScheduleApp(tk.Tk):
         items = [self.db.complaint_by_id(item_id) if kind == "complaint" else self.db.task_by_id(item_id) for item_id in item_ids]
         items = [item for item in items if item]
         max_nodes = max(
-            len(self._progress_node_keys(self._complaint_stages(item))) if kind == "complaint" else len(self._task_stages(item))
+            len(self._progress_node_keys(self._complaint_stages(item))) if kind == "complaint" else len(self._progress_node_keys(self._task_stages(item)))
             for item in items
         )
 
@@ -1939,16 +2155,17 @@ class ScheduleApp(tk.Tk):
         ttk.Entry(form, textvariable=deadline_var).grid(row=0, column=1, sticky="ew", pady=7)
         ttk.Label(form, text=f"비워두면 변경하지 않습니다. ({DATE_HINT})", style="Subtitle.TLabel").grid(row=1, column=1, sticky="w")
 
-        ttk.Label(form, text="진행 단계").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=7)
-        progress_options = ["변경하지 않음", *[f"{index}단계까지 완료" for index in range(1, max_nodes + 1)]]
+        ttk.Label(form, text="진행 항목").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=7)
+        progress_options = ["변경하지 않음", *[f"{index}개 항목 완료" for index in range(1, max_nodes + 1)]]
         progress_var = tk.StringVar(value=progress_options[0])
         ttk.Combobox(form, textvariable=progress_var, values=progress_options, state="readonly").grid(row=2, column=1, sticky="ew", pady=7)
         ttk.Label(form, text="각 업무에 설정된 단계 이름은 유지하고 같은 순번까지 완료합니다.", style="Subtitle.TLabel").grid(row=3, column=1, sticky="w")
 
         priority_var = tk.StringVar(value="변경하지 않음")
         if kind == "task":
-            ttk.Label(form, text="중요도").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=7)
-            ttk.Combobox(form, textvariable=priority_var, values=("변경하지 않음", "낮음", "보통", "높음", "긴급"), state="readonly").grid(row=4, column=1, sticky="ew", pady=7)
+            ttk.Label(form, text="비고").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=7)
+            ttk.Entry(form, textvariable=priority_var).grid(row=4, column=1, sticky="ew", pady=7)
+            ttk.Label(form, text="비워두거나 '변경하지 않음'이면 변경하지 않습니다.", style="Subtitle.TLabel").grid(row=5, column=1, sticky="w")
 
         def save_bulk() -> None:
             deadline = deadline_var.get().strip()
@@ -1958,8 +2175,8 @@ class ScheduleApp(tk.Tk):
                 except ValueError as exc:
                     messagebox.showwarning("날짜 확인", str(exc), parent=window)
                     return
-            completed_count = 0 if progress_var.get() == "변경하지 않음" else int(progress_var.get().split("단계", 1)[0])
-            priority = "" if priority_var.get() == "변경하지 않음" else priority_var.get()
+            completed_count = 0 if progress_var.get() == "변경하지 않음" else int(progress_var.get().split("개", 1)[0])
+            priority = "" if priority_var.get() in {"", "변경하지 않음"} else priority_var.get()
             if not deadline and not completed_count and not priority:
                 messagebox.showinfo("변경할 내용", "변경할 항목을 하나 이상 입력하세요.", parent=window)
                 return
@@ -1978,7 +2195,7 @@ class ScheduleApp(tk.Tk):
                         self.db.update_progress_state(item_id, {"current": current, "completed": nodes[:count]}, self._definition_text_from_key(current, stages))
                     else:
                         stages = self._task_stages(item)
-                        nodes = [f"s:{stage['id']}" for stage in stages]
+                        nodes = self._progress_node_keys(stages)
                         count = min(completed_count, len(nodes))
                         current = nodes[count] if count < len(nodes) else nodes[-1]
                         self.db.update_task_progress_state(item_id, {"current": current, "completed": nodes[:count]}, self._task_stage_text(current, stages))
@@ -2090,6 +2307,94 @@ class ScheduleApp(tk.Tk):
             self.db.permanently_delete(kind, item_ids)
         self.refresh_all()
 
+    def open_task_excel_import(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("수시업무 엑셀 가져오기")
+        window.transient(self)
+        window.geometry("620x230")
+        window.resizable(True, True)
+        window.minsize(520, 210)
+        window.grab_set()
+
+        body = ttk.Frame(window, padding=20)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="수시업무 엑셀 가져오기", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            body,
+            text="샘플 양식을 내려받아 작성한 뒤 불러오면 여러 업무를 한 번에 등록할 수 있습니다.",
+            style="Subtitle.TLabel",
+            wraplength=560,
+        ).pack(anchor="w", pady=(4, 16))
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(22, 0))
+        ttk.Button(
+            actions,
+            text="샘플 엑셀파일 다운로드",
+            style="ExcelAction.TButton",
+            command=lambda: self.download_task_excel_template(window),
+        ).pack(side="left")
+        ttk.Button(
+            actions,
+            text="작성한 엑셀 불러오기",
+            style="ExcelAction.TButton",
+            command=lambda: self.import_task_excel_file(window),
+        ).pack(side="left", padx=8)
+        ttk.Button(actions, text="닫기", style="ExcelAction.TButton", command=window.destroy).pack(side="right")
+
+    def download_task_excel_template(self, parent: tk.Misc) -> None:
+        selected = filedialog.asksaveasfilename(
+            parent=parent,
+            title="수시업무 샘플 엑셀 저장",
+            defaultextension=".xlsx",
+            initialfile="수시업무_가져오기_샘플.xlsx",
+            filetypes=(("Excel 파일", "*.xlsx"),),
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            create_task_template(path)
+        except Exception as exc:
+            messagebox.showerror("샘플을 저장할 수 없음", str(exc), parent=parent)
+            return
+        messagebox.showinfo("샘플 저장 완료", f"샘플 엑셀파일을 저장했습니다.\n\n{path}", parent=parent)
+
+    def import_task_excel_file(self, parent: tk.Misc) -> None:
+        selected = filedialog.askopenfilename(
+            parent=parent,
+            title="수시업무 엑셀 선택",
+            filetypes=(("Excel 파일", "*.xls *.xlsx *.xlsm"), ("모든 파일", "*.*")),
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            items = preview_task_import(path)
+        except Exception as exc:
+            messagebox.showerror("엑셀을 가져올 수 없음", str(exc), parent=parent)
+            return
+        if not items:
+            messagebox.showinfo("등록할 업무 없음", "완전히 비어 있지 않은 업무 행을 찾지 못했습니다.", parent=parent)
+            return
+        if not messagebox.askyesno(
+            "수시업무 일괄 등록",
+            f"{path.name}에서 {len(items)}건을 수시업무로 등록할까요?\n빈 셀은 빈 값 그대로 등록됩니다.",
+            parent=parent,
+        ):
+            return
+        try:
+            initial_node = self._progress_node_keys(self.task_stage_config)[0]
+            initial_stage = self._task_stage_text(initial_node, self.task_stage_config)
+            counts = apply_task_import(path, self.db, items, initial_stage)
+        except Exception as exc:
+            messagebox.showerror("수시업무를 등록할 수 없음", str(exc), parent=parent)
+            return
+        self.refresh_all()
+        messagebox.showinfo("수시업무 등록 완료", f"수시업무 {counts['new']}건을 등록했습니다.", parent=parent)
+        if parent.winfo_exists():
+            parent.destroy()
+
     def open_excel_import(self) -> None:
         selected = filedialog.askopenfilename(
             parent=self,
@@ -2113,7 +2418,7 @@ class ScheduleApp(tk.Tk):
                 f"처리기한 갱신 {counts['changed']}건\n"
                 f"기존과 동일 {counts['skipped']}건\n"
                 f"오류 {counts['error']}건\n\n"
-                "민원 신청 처리 화면에 자동 반영했습니다."
+                "새올 민원 처리 화면에 자동 반영했습니다."
             ),
             parent=self,
         )
@@ -2204,6 +2509,7 @@ class ScheduleApp(tk.Tk):
         self.refresh_complaints()
         self.refresh_tasks()
         self.refresh_today()
+        self.refresh_calendar()
         self.refresh_completed()
         self.refresh_trash()
         self.refresh_summary()
@@ -2212,7 +2518,8 @@ class ScheduleApp(tk.Tk):
         self._clear_tree(self.complaint_tree)
         self._complaint_progress.clear()
         query = self.complaint_search.get().strip().lower()
-        for item in self.db.list_complaints():
+        complaints = self.db.list_complaints()
+        for item in complaints:
             haystack = " ".join((item["receipt_no"], item["complaint_name"], item["applicant_name"], item["birth_date"])).lower()
             if query and query not in haystack:
                 continue
@@ -2251,8 +2558,6 @@ class ScheduleApp(tk.Tk):
     def _matches_quick_filter(deadline: str, mode: str, priority: str = "") -> bool:
         if mode == "전체":
             return True
-        if mode == "높음·긴급":
-            return priority in {"높음", "긴급"}
         try:
             delta = (parse_deadline(deadline).date() - date.today()).days
         except ValueError:
@@ -2271,6 +2576,397 @@ class ScheduleApp(tk.Tk):
         result = [("민원 신청", item, item["current_deadline"]) for item in self.db.list_complaints()]
         result += [("수시업무", item, item["deadline"]) for item in self.db.list_tasks()]
         return result
+
+    def _calendar_items(self) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        for complaint in self.db.list_complaints():
+            complaint_details = [f"진행 현황: {complaint['processing_stage']}"]
+            if complaint.get("assignee"):
+                complaint_details.append(f"담당자: {complaint['assignee']}")
+            if complaint.get("memo"):
+                complaint_details.append(f"메모: {complaint['memo']}")
+            items.append(
+                {
+                    "kind": "complaint",
+                    "label": "새올 민원",
+                    "id": int(complaint["id"]),
+                    "title": str(complaint["complaint_name"]),
+                    "deadline": str(complaint["current_deadline"]),
+                    "time": "",
+                    "details": "\n".join(complaint_details),
+                }
+            )
+        for task in self.db.list_tasks():
+            task_details = [f"진행 현황: {task['processing_stage']}"]
+            if task.get("priority"):
+                task_details.append(f"비고: {task['priority']}")
+            if task.get("content"):
+                task_details.append(f"업무 내용: {task['content']}")
+            items.append(
+                {
+                    "kind": "task",
+                    "label": "수시업무",
+                    "id": int(task["id"]),
+                    "title": str(task["title"]),
+                    "deadline": str(task["deadline"]),
+                    "time": "",
+                    "details": "\n".join(task_details),
+                }
+            )
+        for event in self.db.list_calendar_events():
+            event_time = str(event.get("event_time", ""))
+            items.append(
+                {
+                    "kind": "event",
+                    "label": "일정",
+                    "id": int(event["id"]),
+                    "title": str(event["title"]),
+                    "deadline": f"{event['event_date']} {event_time}".strip(),
+                    "calendar_date": str(event["event_date"]),
+                    "time": event_time,
+                    "details": str(event["details"]),
+                }
+            )
+        return items
+
+    def _filtered_calendar_items(self) -> list[dict[str, object]]:
+        mode = self.calendar_filter.get() if hasattr(self, "calendar_filter") else "전체"
+        return [
+            item
+            for item in self._calendar_items()
+            if mode == "전체"
+            or (mode == "새올 민원" and item["kind"] == "complaint")
+            or (mode == "수시업무" and item["kind"] == "task")
+            or (mode == "일정" and item["kind"] == "event")
+        ]
+
+    @staticmethod
+    def _calendar_deadline_date(item: dict[str, object]) -> date | None:
+        try:
+            return parse_deadline(str(item.get("calendar_date", item["deadline"]))).date()
+        except ValueError:
+            return None
+
+    def change_calendar_month(self, direction: int) -> None:
+        year = self.calendar_month.year
+        month = self.calendar_month.month + direction
+        if month < 1:
+            year -= 1
+            month = 12
+        elif month > 12:
+            year += 1
+            month = 1
+        self.calendar_month = date(year, month, 1)
+        self.calendar_selected_date = self.calendar_month
+        self.refresh_calendar()
+
+    def go_calendar_today(self) -> None:
+        today = date.today()
+        self.calendar_month = today.replace(day=1)
+        self.calendar_selected_date = today
+        self.refresh_calendar()
+
+    def select_calendar_date(self, selected: date) -> None:
+        self.calendar_selected_date = selected
+        self.refresh_calendar()
+
+    def schedule_calendar_date_selection(self, selected: date) -> None:
+        pending = getattr(self, "_calendar_click_job", None)
+        if pending is not None:
+            self.after_cancel(pending)
+
+        def apply_selection() -> None:
+            self._calendar_click_job = None
+            self.select_calendar_date(selected)
+
+        self._calendar_click_job = self.after(240, apply_selection)
+
+    def add_calendar_event_dialog(self, selected: date, event: dict[str, object] | None = None) -> None:
+        pending = getattr(self, "_calendar_click_job", None)
+        if pending is not None:
+            self.after_cancel(pending)
+            self._calendar_click_job = None
+        self.calendar_selected_date = selected
+        editing = event is not None
+        window = tk.Toplevel(self)
+        window.title(f"일정 {'수정' if editing else '등록'} · {selected.isoformat()}")
+        window.transient(self)
+        window.geometry("620x470")
+        window.minsize(520, 390)
+        window.resizable(True, True)
+        window.grab_set()
+        body = ttk.Frame(window, padding=20)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(4, weight=1)
+
+        action_label = "일정 수정" if editing else "일정 등록"
+        ttk.Label(body, text=action_label, style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        ttk.Label(body, text="날짜 *").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=6)
+        date_var = tk.StringVar(value=str(event.get("event_date", selected.isoformat())) if event else selected.isoformat())
+        ttk.Entry(body, textvariable=date_var).grid(row=1, column=1, sticky="ew", pady=6)
+
+        ttk.Label(body, text="일정 제목 *").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=6)
+        title_var = tk.StringVar(value=str(event.get("title", "")) if event else "")
+        ttk.Entry(body, textvariable=title_var).grid(row=2, column=1, sticky="ew", pady=6)
+
+        ttk.Label(body, text="시간 선택").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
+        time_row = ttk.Frame(body)
+        time_row.grid(row=3, column=1, sticky="w", pady=6)
+        saved_time = str(event.get("event_time", "")) if event else ""
+        saved_hour, saved_minute = (saved_time.split(":", 1) if ":" in saved_time else ("", ""))
+        hour_var = tk.StringVar(value=f"{int(saved_hour)}시" if saved_hour else "")
+        minute_var = tk.StringVar(value=f"{int(saved_minute)}분" if saved_minute else "")
+        ttk.Combobox(
+            time_row,
+            textvariable=hour_var,
+            values=("", *[f"{value}시" for value in range(25)]),
+            state="readonly",
+            width=8,
+        ).pack(side="left")
+        ttk.Combobox(
+            time_row,
+            textvariable=minute_var,
+            values=("", *[f"{value}분" for value in range(61)]),
+            state="readonly",
+            width=8,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(time_row, text="선택하지 않아도 등록됩니다.", style="Subtitle.TLabel").pack(side="left", padx=(10, 0))
+
+        ttk.Label(body, text="상세 내용").grid(row=4, column=0, sticky="nw", padx=(0, 12), pady=6)
+        details = tk.Text(body, height=8, wrap="word", font=self.input_font)
+        details.insert("1.0", str(event.get("details", "")) if event else "")
+        details.grid(row=4, column=1, sticky="nsew", pady=6)
+
+        def save() -> None:
+            title = title_var.get().strip()
+            if not title:
+                messagebox.showwarning("입력 확인", "일정 제목을 입력하세요.", parent=window)
+                return
+            try:
+                event_date = parse_deadline(date_var.get().strip()).date()
+            except ValueError as exc:
+                messagebox.showwarning("날짜 확인", str(exc), parent=window)
+                return
+            hour_text = hour_var.get()
+            minute_text = minute_var.get()
+            if minute_text and not hour_text:
+                messagebox.showwarning("시간 확인", "분을 선택하려면 시간도 함께 선택하세요.", parent=window)
+                return
+            event_time = ""
+            if hour_text:
+                hour = int(hour_text.removesuffix("시"))
+                minute = int(minute_text.removesuffix("분")) if minute_text else 0
+                event_time = f"{hour:02d}:{minute:02d}"
+            if editing:
+                self.db.update_calendar_event(
+                    int(event["id"]),
+                    event_date.isoformat(),
+                    title,
+                    details.get("1.0", "end").strip(),
+                    event_time,
+                )
+            else:
+                self.db.add_calendar_event(
+                    event_date.isoformat(),
+                    title,
+                    details.get("1.0", "end").strip(),
+                    event_time,
+                )
+            self.calendar_month = event_date.replace(day=1)
+            self.calendar_selected_date = event_date
+            self.refresh_all()
+            window.destroy()
+
+        actions = ttk.Frame(body)
+        actions.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(actions, text="취소", command=window.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(actions, text=action_label, style="Accent.TButton", command=save).pack(side="right")
+
+    def refresh_calendar(self) -> None:
+        if not hasattr(self, "calendar_days_frame"):
+            return
+        self.calendar_month_var.set(f"{self.calendar_month.year}년 {self.calendar_month.month}월")
+        items = self._filtered_calendar_items()
+        dated_items = [(item, self._calendar_deadline_date(item)) for item in items]
+
+        for child in self.calendar_days_frame.winfo_children():
+            child.destroy()
+        weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(
+            self.calendar_month.year,
+            self.calendar_month.month,
+        )
+        today = date.today()
+        korean_holidays = holidays.country_holidays(
+            "KR",
+            years=[self.calendar_month.year],
+            language="ko",
+        )
+        for row, week in enumerate(weeks):
+            self.calendar_days_frame.rowconfigure(row, weight=1, uniform="calendar-row")
+            for column, day in enumerate(week):
+                in_month = day.month == self.calendar_month.month
+                day_items = [item for item, item_date in dated_items if item_date == day] if in_month else []
+                complaint_count = sum(item["kind"] == "complaint" for item in day_items)
+                task_count = sum(item["kind"] == "task" for item in day_items)
+                event_count = sum(item["kind"] == "event" for item in day_items)
+
+                selected = in_month and day == self.calendar_selected_date
+                background = "#D8F0CD" if selected else "#FFFFFF" if in_month else "#EEF2EC"
+                if not in_month:
+                    foreground = "#A8B2A8"
+                elif column == 5:
+                    foreground = "#3478C5"
+                elif column == 6:
+                    foreground = "#D74343"
+                else:
+                    foreground = PALETTE["text"]
+                border_color = (
+                    PALETTE["green_dark"]
+                    if selected
+                    else PALETTE["green"]
+                    if day == today and in_month
+                    else "#D9E5D6"
+                )
+                day_canvas = tk.Canvas(
+                    self.calendar_days_frame,
+                    background=background,
+                    highlightthickness=2 if selected or day == today and in_month else 1,
+                    highlightbackground=border_color,
+                    height=82,
+                    cursor="hand2" if in_month else "",
+                )
+                day_canvas.grid(row=row, column=column, sticky="nsew", padx=1, pady=1)
+                day_canvas.create_text(8, 7, anchor="nw", text=str(day.day), fill=foreground, font=(self.ui_font, 10, "bold"))
+                holiday_name = str(korean_holidays.get(day, "")) if in_month else ""
+                if holiday_name:
+                    display_holiday = holiday_name if len(holiday_name) <= 15 else holiday_name[:14] + "…"
+                    day_canvas.create_text(30, 9, anchor="nw", text=display_holiday, fill="#D74343", font=(self.ui_font, 8, "bold"))
+                count_y = 33
+                for count_label, count, color in (
+                    ("새올", complaint_count, "#8A4DBF"),
+                    ("수시업무", task_count, "#3478C5"),
+                    ("일정", event_count, "#202020"),
+                ):
+                    if count:
+                        day_canvas.create_text(
+                            8,
+                            count_y,
+                            anchor="nw",
+                            text=f"{count_label} {count}",
+                            fill=color,
+                            font=(self.ui_font, 8, "bold"),
+                        )
+                        count_y += 16
+                if in_month:
+                    day_canvas.bind("<Button-1>", lambda _event, value=day: self.schedule_calendar_date_selection(value))
+                    day_canvas.bind("<Double-1>", lambda _event, value=day: self.add_calendar_event_dialog(value))
+
+        children = self.calendar_day_tree.get_children("")
+        if children:
+            self.calendar_day_tree.delete(*children)
+        self._calendar_detail_items: dict[str, dict[str, object]] = {}
+
+        selected_items = [
+            item for item, item_date in dated_items
+            if item_date == self.calendar_selected_date
+        ]
+        selected_items.sort(key=lambda item: (str(item["deadline"]), str(item["title"])))
+        self.calendar_selected_var.set(
+            f"{self.calendar_selected_date.year}년 {self.calendar_selected_date.month}월 "
+            f"{self.calendar_selected_date.day}일 · {len(selected_items)}건"
+        )
+        for item in selected_items:
+            iid = f"{item['kind']}:{item['id']}"
+            self.calendar_day_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(item["label"], item["title"], item["time"]),
+                tags=(str(item["kind"]),),
+            )
+            self._calendar_detail_items[iid] = item
+        rows = self.calendar_day_tree.get_children("")
+        if rows:
+            self.calendar_day_tree.selection_set(rows[0])
+            self.calendar_day_tree.focus(rows[0])
+        self.show_calendar_detail()
+
+    def show_calendar_detail(self) -> None:
+        if not hasattr(self, "calendar_detail_var"):
+            return
+        selected = self.calendar_day_tree.selection()
+        item = self._calendar_detail_items.get(selected[0]) if selected else None
+        if not item:
+            self.calendar_detail_title_var.set("선택한 날짜에 표시할 항목이 없습니다.")
+            self.calendar_detail_var.set("")
+            return
+        self.calendar_detail_title_var.set(f"[{item['label']}] {item['title']}")
+        details = str(item.get("details", "")).strip()
+        self.calendar_detail_var.set(details or "입력된 상세 내용이 없습니다.")
+
+    def _selected_calendar_item(self) -> dict[str, object] | None:
+        selected = self.calendar_day_tree.selection()
+        if not selected:
+            messagebox.showinfo("항목 선택", "수정하거나 삭제할 항목을 먼저 선택하세요.", parent=self)
+            return None
+        return self._calendar_detail_items.get(selected[0])
+
+    def edit_selected_calendar_item(self) -> None:
+        item = self._selected_calendar_item()
+        if not item:
+            return
+        kind = str(item["kind"])
+        item_id = int(item["id"])
+        if kind == "event":
+            event = self.db.calendar_event_by_id(item_id)
+            if event:
+                self.add_calendar_event_dialog(
+                    parse_deadline(str(event["event_date"])).date(),
+                    event,
+                )
+            return
+        if kind == "complaint":
+            self.show_page(1)
+            self.complaint_tree.selection_set(str(item_id))
+            self.complaint_tree.see(str(item_id))
+            self.edit_complaint_dialog()
+        elif kind == "task":
+            self.show_page(2)
+            self.task_tree.selection_set(str(item_id))
+            self.task_tree.see(str(item_id))
+            self.edit_task_dialog()
+
+    def delete_selected_calendar_item(self) -> None:
+        item = self._selected_calendar_item()
+        if not item:
+            return
+        kind = str(item["kind"])
+        item_id = int(item["id"])
+        label = str(item["label"])
+        title = str(item["title"])
+        action_text = "삭제" if kind == "event" else "휴지통으로 이동"
+        if not messagebox.askyesno(
+            "선택 항목 삭제",
+            f"[{label}] {title}\n\n이 항목을 {action_text}할까요?",
+            parent=self,
+        ):
+            return
+        if kind == "event":
+            self.db.delete_calendar_event(item_id)
+        else:
+            self.db.move_to_trash(kind, [item_id])
+        self.refresh_all()
+
+    def open_calendar_item(self, tree: ttk.Treeview, event: tk.Event | None = None) -> None:
+        row_id = tree.identify_row(event.y) if event is not None else ""
+        if not row_id:
+            selected = tree.selection()
+            row_id = selected[0] if selected else ""
+        if not row_id or ":" not in row_id:
+            return
+        kind, item_id = row_id.split(":", 1)
+        self._show_source_item(kind, item_id)
 
     def refresh_today(self) -> None:
         self._clear_tree(self.today_tree)
@@ -2298,6 +2994,9 @@ class ScheduleApp(tk.Tk):
         if not row_id or ":" not in row_id:
             return
         kind, item_id = row_id.split(":", 1)
+        self._show_source_item(kind, item_id)
+
+    def _show_source_item(self, kind: str, item_id: str) -> None:
         if kind == "complaint":
             self.complaint_search.set("")
             self.complaint_quick_filter.set("전체")

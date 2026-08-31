@@ -24,7 +24,7 @@ if ($InstallDependencies) {
 }
 
 try {
-    & $BuildPython -c "import PyInstaller, cryptography, openpyxl, pandas, xlrd"
+    & $BuildPython -c "import PyInstaller, cryptography, holidays, openpyxl, pandas, xlrd"
 } catch {
     throw 'Build dependencies are missing. Run this script with -InstallDependencies first.'
 }
