@@ -25,7 +25,7 @@ if (Test-Path -LiteralPath $PythonExe) {
     if ($ShowNotificationSample) {
         Push-Location $ProjectDir
         try {
-            & $PythonExe -c "from notifications import show_windows_notification; show_windows_notification('내 일정 관리하기 - 알림 샘플', '오늘 마감 2건 · 3일 이내 4건 · 기한 초과 1건이 있습니다. 앱에서 확인하세요.')"
+            & $PythonExe -c "from notifications import show_windows_notification; show_windows_notification('간편 플래너 - 알림 샘플', '오늘 마감 2건 · 3일 이내 4건 · 기한 초과 1건이 있습니다. 앱에서 확인하세요.')"
         } finally {
             Pop-Location
         }

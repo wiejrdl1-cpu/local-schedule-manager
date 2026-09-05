@@ -36,7 +36,7 @@ try {
         --clean `
         --onefile `
         --windowed `
-        --name 'LocalScheduleManager' `
+        --name 'EasyPlanner' `
         --icon 'assets\app_icon.ico' `
         --add-data 'assets\app_icon.ico;assets' `
         --collect-data 'holidays' `
@@ -50,7 +50,7 @@ try {
     Pop-Location
 }
 
-$ExePath = Join-Path $ProjectDir 'dist\LocalScheduleManager.exe'
+$ExePath = Join-Path $ProjectDir 'dist\EasyPlanner.exe'
 if (-not (Test-Path -LiteralPath $ExePath)) {
     throw 'The built EXE file was not found.'
 }

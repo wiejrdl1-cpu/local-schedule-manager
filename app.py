@@ -28,7 +28,7 @@ from notifications import show_windows_notification
 from security import InvalidPasswordError
 
 
-APP_TITLE = "내 일정 관리하기"
+APP_TITLE = "간편 플래너"
 DATE_HINT = "YYYY-MM-DD 또는 YYYY-MM-DD HH:MM"
 PALETTE = {
     "background": "#F4FBEF",
@@ -286,19 +286,24 @@ class ScheduleApp(tk.Tk):
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="© 2026 이주삼", style="Subtitle.TLabel").pack(side="right", anchor="ne")
 
-        self.summary_vars = {key: tk.StringVar(value="0") for key in ("민원", "수시업무", "오늘 마감", "3일 이내", "기한 초과")}
+        self.summary_vars = {
+            key: tk.StringVar(value="0")
+            for key in ("민원", "수시업무", "오늘의 일정", "오늘 마감", "3일 이내", "기한 초과")
+        }
         cards = ttk.Frame(root)
         cards.pack(fill="x", pady=(18, 16))
         card_value_colors = {
             "민원": "#202020",
             "수시업무": "#202020",
+            "오늘의 일정": "#202020",
             "오늘 마감": "#D74343",
             "3일 이내": "#E47D26",
             "기한 초과": "#3478C5",
         }
         for col, (label, variable) in enumerate(self.summary_vars.items()):
             card = ttk.Frame(cards, padding=(20, 16), style="Card.TFrame")
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == 4 else 5))
+            last_col = len(self.summary_vars) - 1
+            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == last_col else 5))
             cards.columnconfigure(col, weight=1)
             value_label = tk.Label(
                 card,
@@ -320,7 +325,7 @@ class ScheduleApp(tk.Tk):
                 cursor="hand2",
             )
             name_label.pack(fill="x")
-            destination = 1 if label == "민원" else 2 if label == "수시업무" else 0
+            destination = 1 if label == "민원" else 2 if label == "수시업무" else 3 if label == "오늘의 일정" else 0
             for clickable in (card, value_label, name_label):
                 clickable.bind("<Button-1>", lambda _event, page=destination: self.show_page(page))
 
@@ -1013,13 +1018,13 @@ class ScheduleApp(tk.Tk):
         bar = self._toolbar(self.today_tab)
         guidance = ttk.Frame(bar)
         guidance.pack(side="left")
-        ttk.Label(guidance, text="※ 기한 초과 및 7일 이내 업무", style="Subtitle.TLabel").pack(anchor="w")
+        ttk.Label(guidance, text="※ 기한 초과 및 7일 이내 업무 · 오늘의 일정", style="Subtitle.TLabel").pack(anchor="w")
         ttk.Label(guidance, text="※ 열 제목을 드래그하면 순서를 바꿀 수 있습니다", style="Subtitle.TLabel").pack(anchor="w")
         ttk.Button(bar, text="새로고침", command=self.refresh_all).pack(side="right")
         self.today_tree = self._new_tree(
             self.today_tab,
             ("kind", "title", "person", "deadline", "dday", "status"),
-            ("구분", "업무/민원명", "대상자", "처리기한", "남은 기간", "상태"),
+            ("구분", "업무/민원/일정명", "대상자", "날짜/시간", "남은 기간", "상태"),
             (90, 300, 150, 160, 100, 90),
         )
         self.today_tree.bind("<Double-1>", self.open_today_item)
@@ -2988,6 +2993,27 @@ class ScheduleApp(tk.Tk):
                         deadline, dday_text(deadline), item["processing_stage"] if is_complaint else item["priority"]),
                 tags=(urgency_tag(deadline),),
             )
+        today_text = date.today().isoformat()
+        today_events = [
+            event for event in self.db.list_calendar_events()
+            if str(event["event_date"]) == today_text
+        ]
+        today_events.sort(
+            key=lambda event: (
+                not bool(str(event.get("event_time", ""))),
+                str(event.get("event_time", "")),
+                int(event["id"]),
+            )
+        )
+        for event in today_events:
+            event_time = str(event.get("event_time", ""))
+            date_and_time = f"{today_text} {event_time}".strip()
+            self.today_tree.insert(
+                "",
+                "end",
+                iid=f"event:{event['id']}",
+                values=("일정", event["title"], "", date_and_time, "오늘", "일정"),
+            )
 
     def open_today_item(self, event: tk.Event | None = None) -> None:
         if event is not None:
@@ -3013,6 +3039,23 @@ class ScheduleApp(tk.Tk):
             self.refresh_tasks()
             target_tree = self.task_tree
             page_index = 2
+        elif kind == "event":
+            event = self.db.calendar_event_by_id(int(item_id))
+            if not event:
+                return
+            event_date = parse_deadline(str(event["event_date"])).date()
+            self.calendar_month = event_date.replace(day=1)
+            self.calendar_selected_date = event_date
+            self.calendar_filter.set("전체")
+            self.show_page(3)
+            self.refresh_calendar()
+            calendar_iid = f"event:{item_id}"
+            if self.calendar_day_tree.exists(calendar_iid):
+                self.calendar_day_tree.selection_set(calendar_iid)
+                self.calendar_day_tree.focus(calendar_iid)
+                self.calendar_day_tree.see(calendar_iid)
+                self.show_calendar_detail()
+            return
         else:
             return
         self.show_page(page_index)
@@ -3059,6 +3102,12 @@ class ScheduleApp(tk.Tk):
                 pass
         self.summary_vars["민원"].set(str(len(complaints)))
         self.summary_vars["수시업무"].set(str(len(tasks)))
+        today_text = date.today().isoformat()
+        today_event_count = sum(
+            str(event["event_date"]) == today_text
+            for event in self.db.list_calendar_events()
+        )
+        self.summary_vars["오늘의 일정"].set(str(today_event_count))
         self.summary_vars["오늘 마감"].set(str(sum(delta == 0 for delta in deltas)))
         self.summary_vars["3일 이내"].set(str(sum(0 < delta <= 3 for delta in deltas)))
         self.summary_vars["기한 초과"].set(str(sum(delta < 0 for delta in deltas)))
