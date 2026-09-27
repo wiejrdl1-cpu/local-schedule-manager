@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import calendar
 import os
 import shutil
 import sqlite3
 import sys
-from datetime import datetime
+import uuid
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -91,10 +93,28 @@ class Database:
                 event_time TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL,
                 schedule_type TEXT NOT NULL DEFAULT '개인일정',
+                repeat_type TEXT NOT NULL DEFAULT 'none',
+                repeat_interval INTEGER NOT NULL DEFAULT 1,
+                repeat_weekdays TEXT NOT NULL DEFAULT '',
+                repeat_month_day INTEGER NOT NULL DEFAULT 0,
+                repeat_end_date TEXT NOT NULL DEFAULT '',
                 details_enc TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_kind TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                stored_name TEXT NOT NULL UNIQUE,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attachments_entity
+                ON attachments(entity_kind, entity_id, id);
 
             CREATE TABLE IF NOT EXISTS deadline_extensions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,7 +172,100 @@ class Database:
             self.conn.execute("ALTER TABLE calendar_events ADD COLUMN event_time TEXT NOT NULL DEFAULT ''")
         if "schedule_type" not in event_columns:
             self.conn.execute("ALTER TABLE calendar_events ADD COLUMN schedule_type TEXT NOT NULL DEFAULT '개인일정'")
+        recurrence_columns = {
+            "repeat_type": "TEXT NOT NULL DEFAULT 'none'",
+            "repeat_interval": "INTEGER NOT NULL DEFAULT 1",
+            "repeat_weekdays": "TEXT NOT NULL DEFAULT ''",
+            "repeat_month_day": "INTEGER NOT NULL DEFAULT 0",
+            "repeat_end_date": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in recurrence_columns.items():
+            if column not in event_columns:
+                self.conn.execute(f"ALTER TABLE calendar_events ADD COLUMN {column} {definition}")
         self.conn.commit()
+
+    @property
+    def attachments_dir(self) -> Path:
+        directory = self.data_dir / "attachments"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    @staticmethod
+    def _validate_entity_kind(kind: str) -> None:
+        if kind not in {"complaint", "task", "calendar_event"}:
+            raise ValueError("지원하지 않는 첨부파일 항목입니다.")
+
+    def add_attachment(self, kind: str, item_id: int, source: Path) -> int:
+        self._validate_entity_kind(kind)
+        source = Path(source)
+        if not source.is_file():
+            raise ValueError(f"첨부할 파일을 찾을 수 없습니다: {source.name}")
+        stored_name = f"{uuid.uuid4().hex}{source.suffix}"
+        target = self.attachments_dir / stored_name
+        shutil.copy2(source, target)
+        try:
+            cursor = self.conn.execute(
+                "INSERT INTO attachments(entity_kind, entity_id, display_name, stored_name, file_size, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    kind,
+                    item_id,
+                    source.name,
+                    stored_name,
+                    target.stat().st_size,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            attachment_id = int(cursor.lastrowid)
+            self._log_audit(kind, item_id, "첨부파일 추가", source.name)
+            self.conn.commit()
+            return attachment_id
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+
+    def list_attachments(self, kind: str, item_id: int) -> list[dict[str, Any]]:
+        self._validate_entity_kind(kind)
+        rows = self.conn.execute(
+            "SELECT * FROM attachments WHERE entity_kind=? AND entity_id=? ORDER BY id",
+            (kind, item_id),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["path"] = self.attachments_dir / item["stored_name"]
+            result.append(item)
+        return result
+
+    def attachment_by_id(self, attachment_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM attachments WHERE id=?", (attachment_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["path"] = self.attachments_dir / item["stored_name"]
+        return item
+
+    def delete_attachment(self, attachment_id: int) -> None:
+        attachment = self.attachment_by_id(attachment_id)
+        if not attachment:
+            return
+        self.conn.execute("DELETE FROM attachments WHERE id=?", (attachment_id,))
+        self._log_audit(
+            str(attachment["entity_kind"]),
+            int(attachment["entity_id"]),
+            "첨부파일 삭제",
+            str(attachment["display_name"]),
+        )
+        self.conn.commit()
+        Path(attachment["path"]).unlink(missing_ok=True)
+
+    def _delete_item_attachments(self, kind: str, item_id: int) -> list[Path]:
+        attachments = self.list_attachments(kind, item_id)
+        self.conn.execute(
+            "DELETE FROM attachments WHERE entity_kind=? AND entity_id=?",
+            (kind, item_id),
+        )
+        return [Path(attachment["path"]) for attachment in attachments]
 
     def _log_audit(self, kind: str, item_id: int, action: str, details: str = "") -> None:
         self.conn.execute(
@@ -487,10 +600,14 @@ class Database:
             ORDER BY completed_at DESC, kind DESC, id DESC
             """
         ).fetchall()
+        removed_attachment_paths: list[Path] = []
         for old in completed[30:]:
             old_table = "complaints" if old["kind"] == "complaint" else "tasks"
+            removed_attachment_paths.extend(self._delete_item_attachments(str(old["kind"]), int(old["id"])))
             self.conn.execute(f"DELETE FROM {old_table} WHERE id=?", (old["id"],))  # noqa: S608
         self.conn.commit()
+        for path in removed_attachment_paths:
+            path.unlink(missing_ok=True)
 
     def restore_completed(self, kind: str, item_id: int) -> None:
         table = "complaints" if kind == "complaint" else "tasks"
@@ -535,13 +652,17 @@ class Database:
             return
         table = "complaints" if kind == "complaint" else "tasks"
         placeholders = ",".join("?" for _ in item_ids)
+        removed_attachment_paths: list[Path] = []
         for item_id in item_ids:
             self._log_audit(kind, item_id, "영구 삭제")
+            removed_attachment_paths.extend(self._delete_item_attachments(kind, item_id))
         self.conn.execute(
             f"DELETE FROM {table} WHERE status='삭제' AND id IN ({placeholders})",  # noqa: S608
             tuple(item_ids),
         )
         self.conn.commit()
+        for path in removed_attachment_paths:
+            path.unlink(missing_ok=True)
 
     def extension_history(self, complaint_id: int) -> list[dict[str, str]]:
         rows = self.conn.execute(
@@ -571,12 +692,28 @@ class Database:
         details: str = "",
         event_time: str = "",
         schedule_type: str = "개인일정",
+        recurrence: dict[str, Any] | None = None,
     ) -> int:
+        rule = self._normalize_recurrence(event_date, recurrence)
         now = datetime.now().isoformat(timespec="seconds")
         cursor = self.conn.execute(
-            "INSERT INTO calendar_events(event_date, event_time, title, schedule_type, details_enc, created_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (event_date, event_time, title, schedule_type, self._enc(details), now, now),
+            "INSERT INTO calendar_events(event_date, event_time, title, schedule_type, repeat_type, repeat_interval, "
+            "repeat_weekdays, repeat_month_day, repeat_end_date, details_enc, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_date,
+                event_time,
+                title,
+                schedule_type,
+                rule["repeat_type"],
+                rule["repeat_interval"],
+                rule["repeat_weekdays"],
+                rule["repeat_month_day"],
+                rule["repeat_end_date"],
+                self._enc(details),
+                now,
+                now,
+            ),
         )
         event_id = int(cursor.lastrowid)
         self._log_audit("calendar_event", event_id, "일정 등록", f"{schedule_type} · {event_date}")
@@ -610,13 +747,29 @@ class Database:
         details: str = "",
         event_time: str = "",
         schedule_type: str = "개인일정",
+        recurrence: dict[str, Any] | None = None,
     ) -> None:
         if not self.conn.execute("SELECT id FROM calendar_events WHERE id=?", (event_id,)).fetchone():
             raise ValueError("수정할 일정을 찾을 수 없습니다.")
+        rule = self._normalize_recurrence(event_date, recurrence)
         now = datetime.now().isoformat(timespec="seconds")
         self.conn.execute(
-            "UPDATE calendar_events SET event_date=?, event_time=?, title=?, schedule_type=?, details_enc=?, updated_at=? WHERE id=?",
-            (event_date, event_time, title, schedule_type, self._enc(details), now, event_id),
+            "UPDATE calendar_events SET event_date=?, event_time=?, title=?, schedule_type=?, repeat_type=?, "
+            "repeat_interval=?, repeat_weekdays=?, repeat_month_day=?, repeat_end_date=?, details_enc=?, updated_at=? WHERE id=?",
+            (
+                event_date,
+                event_time,
+                title,
+                schedule_type,
+                rule["repeat_type"],
+                rule["repeat_interval"],
+                rule["repeat_weekdays"],
+                rule["repeat_month_day"],
+                rule["repeat_end_date"],
+                self._enc(details),
+                now,
+                event_id,
+            ),
         )
         self._log_audit("calendar_event", event_id, "일정 수정", f"{schedule_type} · {event_date} {event_time}".strip())
         self.conn.commit()
@@ -625,8 +778,116 @@ class Database:
         if not self.conn.execute("SELECT id FROM calendar_events WHERE id=?", (event_id,)).fetchone():
             return
         self._log_audit("calendar_event", event_id, "일정 삭제")
+        removed_attachment_paths = self._delete_item_attachments("calendar_event", event_id)
         self.conn.execute("DELETE FROM calendar_events WHERE id=?", (event_id,))
         self.conn.commit()
+        for path in removed_attachment_paths:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _normalize_recurrence(event_date: str, recurrence: dict[str, Any] | None) -> dict[str, Any]:
+        recurrence = recurrence or {}
+        repeat_type = str(recurrence.get("repeat_type", "none"))
+        if repeat_type not in {"none", "daily", "weekly", "monthly"}:
+            raise ValueError("반복 유형이 올바르지 않습니다.")
+        try:
+            start = date.fromisoformat(event_date)
+            interval = int(recurrence.get("repeat_interval", 1))
+            month_day = int(recurrence.get("repeat_month_day", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("반복 일정 값을 확인하세요.") from exc
+        if interval < 1:
+            raise ValueError("반복 간격은 1 이상이어야 합니다.")
+        if repeat_type == "none":
+            return {
+                "repeat_type": "none",
+                "repeat_interval": 1,
+                "repeat_weekdays": "",
+                "repeat_month_day": 0,
+                "repeat_end_date": "",
+            }
+        end_text = str(recurrence.get("repeat_end_date", "")).strip()
+        try:
+            end = date.fromisoformat(end_text)
+        except ValueError as exc:
+            raise ValueError("반복 종료일은 YYYY-MM-DD 형식으로 입력하세요.") from exc
+        if end < start:
+            raise ValueError("반복 종료일은 시작일보다 빠를 수 없습니다.")
+        weekdays_text = str(recurrence.get("repeat_weekdays", ""))
+        weekdays = sorted({int(value) for value in weekdays_text.split(",") if value != ""})
+        if any(value < 0 or value > 6 for value in weekdays):
+            raise ValueError("반복 요일을 확인하세요.")
+        if repeat_type == "weekly" and not weekdays:
+            raise ValueError("매주 반복할 요일을 하나 이상 선택하세요.")
+        if repeat_type == "monthly" and not 1 <= month_day <= 31:
+            raise ValueError("매월 반복일은 1일부터 31일 사이여야 합니다.")
+        return {
+            "repeat_type": repeat_type,
+            "repeat_interval": interval,
+            "repeat_weekdays": ",".join(str(value) for value in weekdays),
+            "repeat_month_day": month_day if repeat_type == "monthly" else 0,
+            "repeat_end_date": end.isoformat(),
+        }
+
+    def calendar_events_between(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        if end_date < start_date:
+            return []
+        occurrences: list[dict[str, Any]] = []
+        for event in self.list_calendar_events():
+            for occurrence_date in self._occurrence_dates(event, start_date, end_date):
+                occurrence = dict(event)
+                occurrence["series_start_date"] = event["event_date"]
+                occurrence["event_date"] = occurrence_date.isoformat()
+                occurrences.append(occurrence)
+        occurrences.sort(key=lambda item: (str(item["event_date"]), str(item.get("event_time", "")), int(item["id"])))
+        return occurrences
+
+    @staticmethod
+    def _occurrence_dates(event: dict[str, Any], range_start: date, range_end: date) -> list[date]:
+        start = date.fromisoformat(str(event["event_date"]))
+        repeat_type = str(event.get("repeat_type", "none"))
+        if repeat_type == "none":
+            return [start] if range_start <= start <= range_end else []
+        repeat_end_text = str(event.get("repeat_end_date", ""))
+        repeat_end = date.fromisoformat(repeat_end_text) if repeat_end_text else start
+        first = max(start, range_start)
+        last = min(repeat_end, range_end)
+        if last < first:
+            return []
+        interval = max(1, int(event.get("repeat_interval", 1)))
+        result: list[date] = []
+        if repeat_type == "daily":
+            elapsed = (first - start).days
+            candidate = start + timedelta(days=((elapsed + interval - 1) // interval) * interval)
+            while candidate <= last:
+                result.append(candidate)
+                candidate += timedelta(days=interval)
+            return result
+        if repeat_type == "weekly":
+            weekdays = {int(value) for value in str(event.get("repeat_weekdays", "")).split(",") if value != ""}
+            candidate = first
+            start_week = start - timedelta(days=start.weekday())
+            while candidate <= last:
+                week_index = ((candidate - start_week).days // 7)
+                if week_index % interval == 0 and candidate.weekday() in weekdays:
+                    result.append(candidate)
+                candidate += timedelta(days=1)
+            return result
+        if repeat_type == "monthly":
+            month_day = int(event.get("repeat_month_day", start.day))
+            month_index = start.year * 12 + start.month - 1
+            first_index = first.year * 12 + first.month - 1
+            offset = max(0, first_index - month_index)
+            current_index = month_index + ((offset + interval - 1) // interval) * interval
+            while current_index <= last.year * 12 + last.month - 1:
+                year, zero_based_month = divmod(current_index, 12)
+                month = zero_based_month + 1
+                if month_day <= calendar.monthrange(year, month)[1]:
+                    candidate = date(year, month, month_day)
+                    if first <= candidate <= last and candidate >= start:
+                        result.append(candidate)
+                current_index += interval
+        return result
 
     def backup(self) -> Path:
         backup_dir = self.data_dir / "backups"

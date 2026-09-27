@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -310,6 +311,64 @@ class CoreFlowTests(unittest.TestCase):
         self.db.delete_calendar_event(event_id)
         self.assertIsNone(self.db.calendar_event_by_id(event_id))
 
+    def test_daily_weekly_and_monthly_recurring_events_are_expanded(self) -> None:
+        daily_id = self.db.add_calendar_event(
+            "2026-01-01",
+            "격일 일정",
+            recurrence={"repeat_type": "daily", "repeat_interval": 2, "repeat_end_date": "2026-01-07"},
+        )
+        weekly_id = self.db.add_calendar_event(
+            "2026-01-05",
+            "격주 월수 일정",
+            recurrence={
+                "repeat_type": "weekly",
+                "repeat_interval": 2,
+                "repeat_weekdays": "0,2",
+                "repeat_end_date": "2026-02-02",
+            },
+        )
+        monthly_id = self.db.add_calendar_event(
+            "2026-01-30",
+            "매월 31일 일정",
+            recurrence={
+                "repeat_type": "monthly",
+                "repeat_interval": 1,
+                "repeat_month_day": 31,
+                "repeat_end_date": "2026-04-30",
+            },
+        )
+        occurrences = self.db.calendar_events_between(date(2026, 1, 1), date(2026, 4, 30))
+        by_id: dict[int, list[str]] = {}
+        for event in occurrences:
+            by_id.setdefault(int(event["id"]), []).append(str(event["event_date"]))
+        self.assertEqual(by_id[daily_id], ["2026-01-01", "2026-01-03", "2026-01-05", "2026-01-07"])
+        self.assertEqual(
+            by_id[weekly_id],
+            ["2026-01-05", "2026-01-07", "2026-01-19", "2026-01-21", "2026-02-02"],
+        )
+        self.assertEqual(by_id[monthly_id], ["2026-01-31", "2026-03-31"])
+
+    def test_attachments_are_copied_for_all_item_types_and_cleaned_up(self) -> None:
+        source = self.root / "업무 참고자료.txt"
+        source.write_text("가상의 첨부파일 내용", encoding="utf-8")
+        complaint_id = self.db.add_complaint(
+            {"receipt_no": "R-ATTACH", "complaint_name": "첨부 민원", "received_at": "2026-01-01", "deadline": "2026-01-10"}
+        )
+        task_id = self.db.add_task(
+            {"title": "첨부 업무", "registered_at": "2026-01-01", "deadline": "2026-01-10"}
+        )
+        event_id = self.db.add_calendar_event("2026-01-05", "첨부 일정")
+        for kind, item_id in (("complaint", complaint_id), ("task", task_id), ("calendar_event", event_id)):
+            attachment_id = self.db.add_attachment(kind, item_id, source)
+            attachment = self.db.attachment_by_id(attachment_id)
+            self.assertEqual(attachment["display_name"], source.name)
+            self.assertEqual(Path(attachment["path"]).read_text(encoding="utf-8"), "가상의 첨부파일 내용")
+            self.assertEqual(len(self.db.list_attachments(kind, item_id)), 1)
+        event_attachment_path = Path(self.db.list_attachments("calendar_event", event_id)[0]["path"])
+        self.db.delete_calendar_event(event_id)
+        self.assertFalse(event_attachment_path.exists())
+        self.assertEqual(self.db.list_attachments("calendar_event", event_id), [])
+
     def test_existing_calendar_events_default_to_personal_schedule(self) -> None:
         legacy = sqlite3.connect(self.root / "legacy.db")
         legacy.execute(
@@ -327,7 +386,9 @@ class CoreFlowTests(unittest.TestCase):
         migrated = Database(self.root / "legacy.db")
         try:
             migrated.set_initial_password("migration-test-password")
-            self.assertEqual(migrated.list_calendar_events()[0]["schedule_type"], "개인일정")
+            migrated_event = migrated.list_calendar_events()[0]
+            self.assertEqual(migrated_event["schedule_type"], "개인일정")
+            self.assertEqual(migrated_event["repeat_type"], "none")
         finally:
             migrated.close()
 
