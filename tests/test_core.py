@@ -274,11 +274,12 @@ class CoreFlowTests(unittest.TestCase):
         self.assertEqual(tasks[1]["title"], "")
 
     def test_calendar_event_details_are_saved_and_encrypted(self) -> None:
-        event_id = self.db.add_calendar_event("2026-08-29", "회의 일정", "가상의 상세 회의 내용", "14:30")
+        event_id = self.db.add_calendar_event("2026-08-29", "회의 일정", "가상의 상세 회의 내용", "14:30", "부서일정")
         event = self.db.list_calendar_events()[0]
         self.assertEqual(event["id"], event_id)
         self.assertEqual(event["event_date"], "2026-08-29")
         self.assertEqual(event["event_time"], "14:30")
+        self.assertEqual(event["schedule_type"], "부서일정")
         self.assertEqual(event["title"], "회의 일정")
         self.assertEqual(event["details"], "가상의 상세 회의 내용")
 
@@ -297,15 +298,38 @@ class CoreFlowTests(unittest.TestCase):
             "수정된 회의 일정",
             "수정된 상세 내용",
             "18:00",
+            "개인일정",
         )
         updated = self.db.calendar_event_by_id(event_id)
         self.assertEqual(updated["event_date"], "2026-08-30")
         self.assertEqual(updated["event_time"], "18:00")
+        self.assertEqual(updated["schedule_type"], "개인일정")
         self.assertEqual(updated["title"], "수정된 회의 일정")
         self.assertEqual(updated["details"], "수정된 상세 내용")
 
         self.db.delete_calendar_event(event_id)
         self.assertIsNone(self.db.calendar_event_by_id(event_id))
+
+    def test_existing_calendar_events_default_to_personal_schedule(self) -> None:
+        legacy = sqlite3.connect(self.root / "legacy.db")
+        legacy.execute(
+            "CREATE TABLE calendar_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, event_date TEXT NOT NULL, "
+            "event_time TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, "
+            "details_enc TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        legacy.execute(
+            "INSERT INTO calendar_events(event_date, title, created_at, updated_at) VALUES('2026-09-01', '기존 일정', '', '')"
+        )
+        legacy.commit()
+        legacy.close()
+
+        migrated = Database(self.root / "legacy.db")
+        try:
+            migrated.set_initial_password("migration-test-password")
+            self.assertEqual(migrated.list_calendar_events()[0]["schedule_type"], "개인일정")
+        finally:
+            migrated.close()
 
     def test_task_progress_supports_detail_branches(self) -> None:
         app = object.__new__(ScheduleApp)

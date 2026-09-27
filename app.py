@@ -1027,6 +1027,8 @@ class ScheduleApp(tk.Tk):
             ("구분", "업무/민원/일정명", "대상자", "날짜/시간", "남은 기간", "상태"),
             (90, 300, 150, 160, 100, 90),
         )
+        self.today_tree.tag_configure("personal_event", foreground="#202020", background="#F5FCEF")
+        self.today_tree.tag_configure("department_event", foreground="#155AA8", background="#DDEEFF")
         self.today_tree.bind("<Double-1>", self.open_today_item)
 
     def _build_complaints_tab(self) -> None:
@@ -1106,7 +1108,7 @@ class ScheduleApp(tk.Tk):
         filter_box = ttk.Combobox(
             toolbar,
             textvariable=self.calendar_filter,
-            values=("전체", "새올 민원", "수시업무", "일정"),
+            values=("전체", "새올 민원", "수시업무", "개인일정", "부서일정"),
             state="readonly",
             width=12,
         )
@@ -1175,7 +1177,8 @@ class ScheduleApp(tk.Tk):
         )
         self.calendar_day_tree.tag_configure("complaint", foreground="#8A4DBF")
         self.calendar_day_tree.tag_configure("task", foreground="#3478C5")
-        self.calendar_day_tree.tag_configure("event", foreground="#202020")
+        self.calendar_day_tree.tag_configure("personal_event", foreground="#202020")
+        self.calendar_day_tree.tag_configure("department_event", foreground="#155AA8", background="#DDEEFF")
 
         self.calendar_detail_frame = ttk.LabelFrame(detail_panel, text="일정 상세", padding=10)
         self.calendar_detail_frame.configure(height=170)
@@ -2620,10 +2623,12 @@ class ScheduleApp(tk.Tk):
             )
         for event in self.db.list_calendar_events():
             event_time = str(event.get("event_time", ""))
+            schedule_type = str(event.get("schedule_type", "개인일정"))
             items.append(
                 {
                     "kind": "event",
-                    "label": "일정",
+                    "label": schedule_type,
+                    "schedule_type": schedule_type,
                     "id": int(event["id"]),
                     "title": str(event["title"]),
                     "deadline": f"{event['event_date']} {event_time}".strip(),
@@ -2642,7 +2647,8 @@ class ScheduleApp(tk.Tk):
             if mode == "전체"
             or (mode == "새올 민원" and item["kind"] == "complaint")
             or (mode == "수시업무" and item["kind"] == "task")
-            or (mode == "일정" and item["kind"] == "event")
+            or (mode == "개인일정" and item.get("schedule_type") == "개인일정")
+            or (mode == "부서일정" and item.get("schedule_type") == "부서일정")
         ]
 
     @staticmethod
@@ -2696,14 +2702,14 @@ class ScheduleApp(tk.Tk):
         window = tk.Toplevel(self)
         window.title(f"일정 {'수정' if editing else '등록'} · {selected.isoformat()}")
         window.transient(self)
-        window.geometry("620x470")
-        window.minsize(520, 390)
+        window.geometry("620x520")
+        window.minsize(520, 440)
         window.resizable(True, True)
         window.grab_set()
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
-        body.rowconfigure(4, weight=1)
+        body.rowconfigure(5, weight=1)
 
         action_label = "일정 수정" if editing else "일정 등록"
         ttk.Label(body, text=action_label, style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
@@ -2711,13 +2717,25 @@ class ScheduleApp(tk.Tk):
         date_var = tk.StringVar(value=str(event.get("event_date", selected.isoformat())) if event else selected.isoformat())
         ttk.Entry(body, textvariable=date_var).grid(row=1, column=1, sticky="ew", pady=6)
 
-        ttk.Label(body, text="일정 제목 *").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=6)
-        title_var = tk.StringVar(value=str(event.get("title", "")) if event else "")
-        ttk.Entry(body, textvariable=title_var).grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Label(body, text="일정 구분 *").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=6)
+        schedule_type_var = tk.StringVar(
+            value=str(event.get("schedule_type", "개인일정")) if event else "개인일정"
+        )
+        ttk.Combobox(
+            body,
+            textvariable=schedule_type_var,
+            values=("개인일정", "부서일정"),
+            state="readonly",
+            width=18,
+        ).grid(row=2, column=1, sticky="w", pady=6)
 
-        ttk.Label(body, text="시간 선택").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
+        ttk.Label(body, text="일정 제목 *").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
+        title_var = tk.StringVar(value=str(event.get("title", "")) if event else "")
+        ttk.Entry(body, textvariable=title_var).grid(row=3, column=1, sticky="ew", pady=6)
+
+        ttk.Label(body, text="시간 선택").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=6)
         time_row = ttk.Frame(body)
-        time_row.grid(row=3, column=1, sticky="w", pady=6)
+        time_row.grid(row=4, column=1, sticky="w", pady=6)
         saved_time = str(event.get("event_time", "")) if event else ""
         saved_hour, saved_minute = (saved_time.split(":", 1) if ":" in saved_time else ("", ""))
         hour_var = tk.StringVar(value=f"{int(saved_hour)}시" if saved_hour else "")
@@ -2738,10 +2756,10 @@ class ScheduleApp(tk.Tk):
         ).pack(side="left", padx=(8, 0))
         ttk.Label(time_row, text="선택하지 않아도 등록됩니다.", style="Subtitle.TLabel").pack(side="left", padx=(10, 0))
 
-        ttk.Label(body, text="상세 내용").grid(row=4, column=0, sticky="nw", padx=(0, 12), pady=6)
+        ttk.Label(body, text="상세 내용").grid(row=5, column=0, sticky="nw", padx=(0, 12), pady=6)
         details = tk.Text(body, height=8, wrap="word", font=self.input_font)
         details.insert("1.0", str(event.get("details", "")) if event else "")
-        details.grid(row=4, column=1, sticky="nsew", pady=6)
+        details.grid(row=5, column=1, sticky="nsew", pady=6)
 
         def save() -> None:
             title = title_var.get().strip()
@@ -2770,6 +2788,7 @@ class ScheduleApp(tk.Tk):
                     title,
                     details.get("1.0", "end").strip(),
                     event_time,
+                    schedule_type_var.get(),
                 )
             else:
                 self.db.add_calendar_event(
@@ -2777,6 +2796,7 @@ class ScheduleApp(tk.Tk):
                     title,
                     details.get("1.0", "end").strip(),
                     event_time,
+                    schedule_type_var.get(),
                 )
             self.calendar_month = event_date.replace(day=1)
             self.calendar_selected_date = event_date
@@ -2784,7 +2804,7 @@ class ScheduleApp(tk.Tk):
             window.destroy()
 
         actions = ttk.Frame(body)
-        actions.grid(row=5, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        actions.grid(row=6, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(actions, text="취소", command=window.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text=action_label, style="Accent.TButton", command=save).pack(side="right")
 
@@ -2818,7 +2838,8 @@ class ScheduleApp(tk.Tk):
                 day_items = [item for item, item_date in dated_items if item_date == day] if in_month else []
                 complaint_count = sum(item["kind"] == "complaint" for item in day_items)
                 task_count = sum(item["kind"] == "task" for item in day_items)
-                event_count = sum(item["kind"] == "event" for item in day_items)
+                personal_event_count = sum(item.get("schedule_type") == "개인일정" for item in day_items)
+                department_event_count = sum(item.get("schedule_type") == "부서일정" for item in day_items)
 
                 selected = in_month and day == self.calendar_selected_date
                 background = "#D8F0CD" if selected else "#FFFFFF" if in_month else "#EEF2EC"
@@ -2851,11 +2872,12 @@ class ScheduleApp(tk.Tk):
                 if holiday_name:
                     display_holiday = holiday_name if len(holiday_name) <= 15 else holiday_name[:14] + "…"
                     day_canvas.create_text(30, 9, anchor="nw", text=display_holiday, fill="#D74343", font=(self.ui_font, 8, "bold"))
-                count_y = 33
+                count_y = 30
                 for count_label, count, color in (
                     ("새올", complaint_count, "#8A4DBF"),
                     ("수시업무", task_count, "#3478C5"),
-                    ("일정", event_count, "#202020"),
+                    ("개인", personal_event_count, "#202020"),
+                    ("부서", department_event_count, "#155AA8"),
                 ):
                     if count:
                         day_canvas.create_text(
@@ -2866,7 +2888,7 @@ class ScheduleApp(tk.Tk):
                             fill=color,
                             font=(self.ui_font, 8, "bold"),
                         )
-                        count_y += 16
+                        count_y += 13
                 if in_month:
                     day_canvas.bind("<Button-1>", lambda _event, value=day: self.schedule_calendar_date_selection(value))
                     day_canvas.bind("<Double-1>", lambda _event, value=day: self.add_calendar_event_dialog(value))
@@ -2892,7 +2914,8 @@ class ScheduleApp(tk.Tk):
                 "end",
                 iid=iid,
                 values=(item["label"], item["title"], item["time"]),
-                tags=(str(item["kind"]),),
+                tags=(("department_event" if item.get("schedule_type") == "부서일정" else "personal_event")
+                      if item["kind"] == "event" else str(item["kind"]),),
             )
             self._calendar_detail_items[iid] = item
         rows = self.calendar_day_tree.get_children("")
@@ -3012,7 +3035,8 @@ class ScheduleApp(tk.Tk):
                 "",
                 "end",
                 iid=f"event:{event['id']}",
-                values=("일정", event["title"], "", date_and_time, "오늘", "일정"),
+                values=(event.get("schedule_type", "개인일정"), event["title"], "", date_and_time, "오늘", event.get("schedule_type", "개인일정")),
+                tags=(("department_event" if event.get("schedule_type") == "부서일정" else "personal_event"),),
             )
 
     def open_today_item(self, event: tk.Event | None = None) -> None:

@@ -90,6 +90,7 @@ class Database:
                 event_date TEXT NOT NULL,
                 event_time TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL,
+                schedule_type TEXT NOT NULL DEFAULT '개인일정',
                 details_enc TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -149,6 +150,8 @@ class Database:
         event_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(calendar_events)").fetchall()}
         if "event_time" not in event_columns:
             self.conn.execute("ALTER TABLE calendar_events ADD COLUMN event_time TEXT NOT NULL DEFAULT ''")
+        if "schedule_type" not in event_columns:
+            self.conn.execute("ALTER TABLE calendar_events ADD COLUMN schedule_type TEXT NOT NULL DEFAULT '개인일정'")
         self.conn.commit()
 
     def _log_audit(self, kind: str, item_id: int, action: str, details: str = "") -> None:
@@ -561,14 +564,22 @@ class Database:
         )
         self.conn.commit()
 
-    def add_calendar_event(self, event_date: str, title: str, details: str = "", event_time: str = "") -> int:
+    def add_calendar_event(
+        self,
+        event_date: str,
+        title: str,
+        details: str = "",
+        event_time: str = "",
+        schedule_type: str = "개인일정",
+    ) -> int:
         now = datetime.now().isoformat(timespec="seconds")
         cursor = self.conn.execute(
-            "INSERT INTO calendar_events(event_date, event_time, title, details_enc, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
-            (event_date, event_time, title, self._enc(details), now, now),
+            "INSERT INTO calendar_events(event_date, event_time, title, schedule_type, details_enc, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (event_date, event_time, title, schedule_type, self._enc(details), now, now),
         )
         event_id = int(cursor.lastrowid)
-        self._log_audit("calendar_event", event_id, "일정 등록", event_date)
+        self._log_audit("calendar_event", event_id, "일정 등록", f"{schedule_type} · {event_date}")
         self.conn.commit()
         return event_id
 
@@ -598,15 +609,16 @@ class Database:
         title: str,
         details: str = "",
         event_time: str = "",
+        schedule_type: str = "개인일정",
     ) -> None:
         if not self.conn.execute("SELECT id FROM calendar_events WHERE id=?", (event_id,)).fetchone():
             raise ValueError("수정할 일정을 찾을 수 없습니다.")
         now = datetime.now().isoformat(timespec="seconds")
         self.conn.execute(
-            "UPDATE calendar_events SET event_date=?, event_time=?, title=?, details_enc=?, updated_at=? WHERE id=?",
-            (event_date, event_time, title, self._enc(details), now, event_id),
+            "UPDATE calendar_events SET event_date=?, event_time=?, title=?, schedule_type=?, details_enc=?, updated_at=? WHERE id=?",
+            (event_date, event_time, title, schedule_type, self._enc(details), now, event_id),
         )
-        self._log_audit("calendar_event", event_id, "일정 수정", f"{event_date} {event_time}".strip())
+        self._log_audit("calendar_event", event_id, "일정 수정", f"{schedule_type} · {event_date} {event_time}".strip())
         self.conn.commit()
 
     def delete_calendar_event(self, event_id: int) -> None:
