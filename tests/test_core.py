@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -426,6 +426,20 @@ class CoreFlowTests(unittest.TestCase):
         updated = self.db.task_by_id(task_id)
         self.assertEqual(updated["processing_stage"], "처리중 > 결재")
         self.assertIn("b:working:review", updated["progress_state"])
+
+    def test_dashboard_deadline_filters_match_card_counts(self) -> None:
+        today = date.today()
+        self.assertTrue(ScheduleApp._matches_dashboard_filter(today.isoformat(), "오늘 마감"))
+        self.assertFalse(ScheduleApp._matches_dashboard_filter(today.isoformat(), "3일 이내"))
+        self.assertTrue(
+            ScheduleApp._matches_dashboard_filter((today + timedelta(days=3)).isoformat(), "3일 이내")
+        )
+        self.assertFalse(
+            ScheduleApp._matches_dashboard_filter((today + timedelta(days=4)).isoformat(), "3일 이내")
+        )
+        self.assertTrue(
+            ScheduleApp._matches_dashboard_filter((today - timedelta(days=1)).isoformat(), "기한 초과")
+        )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import calendar
 import json
 import os
 import secrets
+import shutil
 import sys
 import tkinter as tk
 import uuid
@@ -53,6 +54,26 @@ DEFAULT_TASK_STAGES = [
     {"id": "task-complete", "name": "완료", "branches": []},
 ]
 PROGRESS_COLORS = {"completed": "#E34F4F", "current": "#3E82D7", "pending": "#C9CECA"}
+
+
+def prepare_modal_popup(window: tk.Toplevel, owner: tk.Misc) -> None:
+    """Make nested popups independently closable and restore the prior modal grab."""
+    previous_grab = owner.grab_current()
+    transient_owner = previous_grab if previous_grab is not None and previous_grab is not window else owner
+    window.transient(transient_owner)
+
+    def restore_previous_grab(event: tk.Event) -> None:
+        if event.widget is not window or previous_grab is None:
+            return
+        try:
+            if previous_grab.winfo_exists():
+                previous_grab.grab_set()
+                previous_grab.focus_set()
+        except tk.TclError:
+            pass
+
+    window.bind("<Destroy>", restore_previous_grab, add="+")
+    window.grab_set()
 
 
 def resource_path(relative_path: str) -> Path:
@@ -115,7 +136,6 @@ class FormDialog(tk.Toplevel):
     ):
         super().__init__(parent)
         self.title(title)
-        self.transient(parent)
         self.resizable(True, True)
         self.minsize(520, 360)
         self.columnconfigure(0, weight=1)
@@ -163,7 +183,7 @@ class FormDialog(tk.Toplevel):
         ttk.Button(buttons, text="취소", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="저장", style="Accent.TButton", command=self._save).pack(side="right")
         self.bind("<Escape>", lambda _e: self.destroy())
-        self.grab_set()
+        prepare_modal_popup(self, parent)
         self.after(50, lambda: next(iter(self.entries.values())).focus_set())
 
     def _choose_attachments(self) -> None:
@@ -223,6 +243,7 @@ class ScheduleApp(tk.Tk):
         today = date.today()
         self.calendar_month = today.replace(day=1)
         self.calendar_selected_date = today
+        self.dashboard_filter = "전체"
         self._progress_canvases: list[tk.Canvas] = []
         self._complaint_progress_buttons: list[ttk.Button] = []
         self._complaint_progress: dict[str, tuple[dict[str, object], str]] = {}
@@ -341,12 +362,12 @@ class ScheduleApp(tk.Tk):
 
         self.summary_vars = {
             key: tk.StringVar(value="0")
-            for key in ("민원", "수시업무", "오늘의 일정", "오늘 마감", "3일 이내", "기한 초과")
+            for key in ("새올민원", "수시업무", "오늘의 일정", "오늘 마감", "3일 이내", "기한 초과")
         }
         cards = ttk.Frame(root)
         cards.pack(fill="x", pady=(18, 16))
         card_value_colors = {
-            "민원": "#202020",
+            "새올민원": "#202020",
             "수시업무": "#202020",
             "오늘의 일정": "#202020",
             "오늘 마감": "#D74343",
@@ -378,9 +399,12 @@ class ScheduleApp(tk.Tk):
                 cursor="hand2",
             )
             name_label.pack(fill="x")
-            destination = 1 if label == "민원" else 2 if label == "수시업무" else 3 if label == "오늘의 일정" else 0
             for clickable in (card, value_label, name_label):
-                clickable.bind("<Button-1>", lambda _event, page=destination: self.show_page(page))
+                if label in {"오늘 마감", "3일 이내", "기한 초과"}:
+                    clickable.bind("<Button-1>", lambda _event, mode=label: self.show_deadline_dashboard(mode))
+                else:
+                    destination = 1 if label == "새올민원" else 2 if label == "수시업무" else 3
+                    clickable.bind("<Button-1>", lambda _event, page=destination: self.show_page(page))
 
         navigation = ttk.Frame(root)
         navigation.pack(fill="x", pady=(0, 14))
@@ -409,7 +433,7 @@ class ScheduleApp(tk.Tk):
                 navigation,
                 text=text,
                 style="Nav.TButton",
-                command=lambda page=index: self.show_page(page),
+                command=lambda page=index: self.show_today_page() if page == 0 else self.show_page(page),
             )
             button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0 if index == len(pages) - 1 else 4))
             self.nav_buttons.append(button)
@@ -427,6 +451,16 @@ class ScheduleApp(tk.Tk):
             button.configure(style="NavActive.TButton" if button_index == index else "Nav.TButton")
         self.after_idle(self._draw_complaint_progress)
         self.after_idle(self._draw_task_progress)
+
+    def show_today_page(self) -> None:
+        self.dashboard_filter = "전체"
+        self.refresh_today()
+        self.show_page(0)
+
+    def show_deadline_dashboard(self, mode: str) -> None:
+        self.dashboard_filter = mode
+        self.refresh_today()
+        self.show_page(0)
 
     def _load_stage_config(self) -> list[dict[str, object]]:
         raw = self.db.get_setting("processing_stage_config")
@@ -1071,9 +1105,11 @@ class ScheduleApp(tk.Tk):
         bar = self._toolbar(self.today_tab)
         guidance = ttk.Frame(bar)
         guidance.pack(side="left")
-        ttk.Label(guidance, text="※ 기한 초과 및 7일 이내 업무 · 오늘의 일정", style="Subtitle.TLabel").pack(anchor="w")
+        self.today_guidance_var = tk.StringVar(value="※ 기한 초과 및 7일 이내 업무 · 오늘의 일정")
+        ttk.Label(guidance, textvariable=self.today_guidance_var, style="Subtitle.TLabel").pack(anchor="w")
         ttk.Label(guidance, text="※ 열 제목을 드래그하면 순서를 바꿀 수 있습니다", style="Subtitle.TLabel").pack(anchor="w")
         ttk.Button(bar, text="새로고침", command=self.refresh_all).pack(side="right")
+        ttk.Button(bar, text="기본 보기", command=self.show_today_page).pack(side="right", padx=6)
         ttk.Button(bar, text="첨부파일", command=lambda: self.open_tree_attachment_manager(self.today_tree)).pack(side="right", padx=6)
         self.today_tree = self._new_tree(
             self.today_tab,
@@ -1103,8 +1139,6 @@ class ScheduleApp(tk.Tk):
         ttk.Button(actions, text="민원 수기 등록", style="Accent.TButton", command=self.add_complaint_dialog).pack(side="left")
         ttk.Button(actions, text="엑셀로 가져오기", command=self.open_excel_import).pack(side="left", padx=6)
         ttk.Button(actions, text="선택 항목 일괄 변경", style="Accent.TButton", command=lambda: self.open_bulk_change_dialog("complaint")).pack(side="left")
-        ttk.Button(actions, text="변경 이력", command=lambda: self.show_audit_history("complaint")).pack(side="left", padx=6)
-        ttk.Button(actions, text="첨부파일", command=lambda: self.open_selected_kind_attachments("complaint", self.complaint_tree)).pack(side="left")
         right_actions = ttk.Frame(actions)
         right_actions.pack(side="right")
         ttk.Button(right_actions, text="진행 현황 사용자 정의", style="Accent.TButton", command=self.open_stage_editor).pack(side="left", padx=6)
@@ -1113,9 +1147,9 @@ class ScheduleApp(tk.Tk):
         ttk.Button(right_actions, text="처리기한 연장", command=self.extend_complaint_dialog).pack(side="left", padx=6)
         self.complaint_tree = self._new_tree(
             self.complaints_tab,
-            ("receipt", "name", "person", "received", "deadline", "dday", "progress", "progress_edit"),
-            ("접수번호", "민원명", "민원인", "받은일자", "현재 처리기한", "남은 기간", "진행 현황", "진행 현황 수정"),
-            (110, 170, 90, 95, 130, 75, 410, 120),
+            ("memo_check", "receipt", "name", "person", "received", "deadline", "dday", "progress", "progress_edit"),
+            ("메모확인", "접수번호", "민원명", "민원인", "받은일자", "현재 처리기한", "남은 기간", "진행 현황", "진행 현황 수정"),
+            (80, 110, 170, 90, 95, 130, 75, 390, 120),
         )
         self.complaint_tree.bind("<Double-1>", self.edit_complaint_dialog)
 
@@ -1137,8 +1171,6 @@ class ScheduleApp(tk.Tk):
         ttk.Button(actions, text="수시업무 등록", style="Accent.TButton", command=self.add_task_dialog).pack(side="left")
         ttk.Button(actions, text="엑셀로 가져오기", command=self.open_task_excel_import).pack(side="left", padx=6)
         ttk.Button(actions, text="선택 항목 일괄 변경", style="Accent.TButton", command=lambda: self.open_bulk_change_dialog("task")).pack(side="left", padx=6)
-        ttk.Button(actions, text="변경 이력", command=lambda: self.show_audit_history("task")).pack(side="left")
-        ttk.Button(actions, text="첨부파일", command=lambda: self.open_selected_kind_attachments("task", self.task_tree)).pack(side="left", padx=6)
         right_actions = ttk.Frame(actions)
         right_actions.pack(side="right")
         ttk.Button(right_actions, text="진행 현황 사용자 정의", style="Accent.TButton", command=self.open_task_stage_editor).pack(side="left", padx=6)
@@ -1146,9 +1178,9 @@ class ScheduleApp(tk.Tk):
         ttk.Button(right_actions, text="처리 완료", command=self.complete_task).pack(side="left")
         self.task_tree = self._new_tree(
             self.tasks_tab,
-            ("title", "registered", "deadline", "dday", "priority", "progress", "progress_edit"),
-            ("업무 제목", "등록일", "처리기한", "남은 기간", "비고", "진행 현황", "진행 현황 수정"),
-            (280, 110, 140, 90, 90, 390, 120),
+            ("content_check", "title", "registered", "deadline", "dday", "priority", "progress", "progress_edit"),
+            ("업무확인", "업무 제목", "등록일", "처리기한", "남은 기간", "비고", "진행 현황", "진행 현황 수정"),
+            (80, 260, 110, 140, 90, 90, 370, 120),
         )
         self.task_tree.bind("<Double-1>", self.edit_task_dialog)
 
@@ -1395,9 +1427,9 @@ class ScheduleApp(tk.Tk):
         labels = {"complaint": "새올 민원", "task": "수시업무", "calendar_event": "일정"}
         window = tk.Toplevel(self)
         window.title(f"{labels.get(kind, '항목')} 첨부파일")
-        window.transient(self)
         window.geometry("760x430")
         window.minsize(620, 340)
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=18)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="첨부파일", style="Title.TLabel").pack(anchor="w")
@@ -1464,6 +1496,32 @@ class ScheduleApp(tk.Tk):
             except Exception as exc:
                 messagebox.showerror("파일을 열 수 없음", str(exc), parent=window)
 
+        def download_file() -> None:
+            attachment = selected_attachment()
+            if not attachment:
+                return
+            source = Path(attachment["path"])
+            if not source.exists():
+                messagebox.showwarning("파일 없음", "저장된 첨부파일을 찾을 수 없습니다.", parent=window)
+                return
+            destination = filedialog.asksaveasfilename(
+                parent=window,
+                title="첨부파일 다운로드",
+                initialfile=str(attachment["display_name"]),
+                defaultextension=source.suffix,
+                filetypes=(("모든 파일", "*.*"),),
+            )
+            if not destination:
+                return
+            try:
+                target = Path(destination)
+                if source.resolve() != target.resolve():
+                    shutil.copy2(source, target)
+            except Exception as exc:
+                messagebox.showerror("다운로드할 수 없음", str(exc), parent=window)
+                return
+            messagebox.showinfo("다운로드 완료", f"첨부파일을 저장했습니다.\n\n{destination}", parent=window)
+
         def delete_file() -> None:
             attachment = selected_attachment()
             if not attachment:
@@ -1481,18 +1539,20 @@ class ScheduleApp(tk.Tk):
         actions.pack(fill="x", pady=(12, 0))
         ttk.Button(actions, text="파일 추가", style="Accent.TButton", command=add_files).pack(side="left")
         ttk.Button(actions, text="선택 파일 열기", command=open_file).pack(side="left", padx=6)
-        ttk.Button(actions, text="선택 파일 삭제", command=delete_file).pack(side="left")
+        ttk.Button(actions, text="선택 파일 다운로드", command=download_file).pack(side="left")
+        ttk.Button(actions, text="선택 파일 삭제", command=delete_file).pack(side="left", padx=6)
         ttk.Button(actions, text="닫기", command=window.destroy).pack(side="right")
         tree.bind("<Double-1>", lambda _event: open_file())
         refresh()
 
-    def edit_complaint_dialog(self, event: tk.Event | None = None) -> None:
-        if event is not None:
+    def edit_complaint_dialog(self, event: tk.Event | None = None, complaint_id: int | None = None) -> None:
+        if complaint_id is None and event is not None:
             row_id = self.complaint_tree.identify_row(event.y)
             if not row_id:
                 return
             self.complaint_tree.selection_set(row_id)
-        complaint_id = self._selected_id(self.complaint_tree)
+        if complaint_id is None:
+            complaint_id = self._selected_id(self.complaint_tree)
         if complaint_id is None:
             return
         complaint = self.db.complaint_by_id(complaint_id)
@@ -1501,11 +1561,10 @@ class ScheduleApp(tk.Tk):
 
         window = tk.Toplevel(self)
         window.title("민원 신청 내용 수정")
-        window.transient(self)
         window.geometry("720x590")
         window.resizable(True, True)
         window.minsize(600, 480)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="민원 신청 내용 수정", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
@@ -1535,7 +1594,7 @@ class ScheduleApp(tk.Tk):
         ttk.Label(body, text="첨부파일").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
         ttk.Button(
             body,
-            text="첨부파일 추가·열기·삭제",
+            text="첨부파일 추가·열기·다운로드·삭제",
             command=lambda: self.open_attachment_manager("complaint", complaint_id),
         ).grid(row=row, column=1, sticky="w", pady=5)
         row += 1
@@ -1572,13 +1631,14 @@ class ScheduleApp(tk.Tk):
         ttk.Button(buttons, text="취소", command=window.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="수정 저장", style="Accent.TButton", command=save).pack(side="right")
 
-    def edit_task_dialog(self, event: tk.Event | None = None) -> None:
-        if event is not None:
+    def edit_task_dialog(self, event: tk.Event | None = None, task_id: int | None = None) -> None:
+        if task_id is None and event is not None:
             row_id = self.task_tree.identify_row(event.y)
             if not row_id:
                 return
             self.task_tree.selection_set(row_id)
-        task_id = self._selected_id(self.task_tree)
+        if task_id is None:
+            task_id = self._selected_id(self.task_tree)
         if task_id is None:
             return
         task = self.db.task_by_id(task_id)
@@ -1629,11 +1689,10 @@ class ScheduleApp(tk.Tk):
         completed = set(state.get("completed", []))
         window = tk.Toplevel(self)
         window.title("진행 현황 수정")
-        window.transient(self)
         window.geometry("620x600")
         window.resizable(True, True)
         window.minsize(500, 420)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="진행 현황 수정", style="Title.TLabel").pack(anchor="w")
@@ -1696,11 +1755,10 @@ class ScheduleApp(tk.Tk):
 
         window = tk.Toplevel(self)
         window.title("진행 현황 설정")
-        window.transient(self)
         window.geometry("760x680")
         window.resizable(True, True)
         window.minsize(620, 500)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="진행 현황 설정", style="Title.TLabel").pack(anchor="w")
@@ -1798,11 +1856,10 @@ class ScheduleApp(tk.Tk):
 
         window = tk.Toplevel(self)
         window.title("현재 처리단계 기록")
-        window.transient(self)
         window.geometry("620x540")
         window.resizable(True, True)
         window.minsize(520, 420)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text=complaint["complaint_name"], style="Title.TLabel").pack(anchor="w")
@@ -1876,11 +1933,10 @@ class ScheduleApp(tk.Tk):
         working = json.loads(json.dumps(self.stage_config, ensure_ascii=False))
         window = tk.Toplevel(self)
         window.title("진행 현황 사용자 정의")
-        window.transient(self)
         window.geometry("820x650")
         window.resizable(True, True)
         window.minsize(700, 550)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="진행 현황 사용자 정의", style="Title.TLabel").pack(anchor="w")
@@ -2047,11 +2103,10 @@ class ScheduleApp(tk.Tk):
         working = json.loads(json.dumps(self.task_stage_config, ensure_ascii=False))
         window = tk.Toplevel(self)
         window.title("수시업무 진행 현황 사용자 정의")
-        window.transient(self)
         window.geometry("760x620")
         window.resizable(True, True)
         window.minsize(650, 520)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="수시업무 진행 현황 사용자 정의", style="Title.TLabel").pack(anchor="w")
@@ -2192,11 +2247,10 @@ class ScheduleApp(tk.Tk):
             window.title("진행 현황 수정")
         else:
             window.title("수시업무 진행 현황 사용자 정의" if task_mode else "진행 현황 사용자 정의")
-        window.transient(self)
         window.geometry("840x700")
         window.resizable(True, True)
         window.minsize(680, 520)
-        window.grab_set()
+        prepare_modal_popup(window, self)
 
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
@@ -2316,8 +2370,8 @@ class ScheduleApp(tk.Tk):
         item_id = self._selected_id(self.complaint_tree)
         if item_id is None:
             return
-        values = self.complaint_tree.item(str(item_id), "values")
-        old_deadline = values[4] if values else ""
+        complaint = self.db.complaint_by_id(item_id)
+        old_deadline = complaint["current_deadline"] if complaint else ""
         fields = [("deadline", f"새 처리기한 * ({DATE_HINT})", old_deadline), ("reason", "연장 사유 *", "")]
 
         def save(data: dict[str, str]) -> None:
@@ -2346,11 +2400,10 @@ class ScheduleApp(tk.Tk):
 
         window = tk.Toplevel(self)
         window.title("선택 항목 일괄 변경")
-        window.transient(self)
         window.geometry("620x430")
         window.resizable(True, True)
         window.minsize(520, 360)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="선택 항목 일괄 변경", style="Title.TLabel").pack(anchor="w")
@@ -2426,10 +2479,10 @@ class ScheduleApp(tk.Tk):
         history = self.db.audit_history(kind, item_id)
         window = tk.Toplevel(self)
         window.title("변경 이력")
-        window.transient(self)
         window.geometry("820x520")
         window.resizable(True, True)
         window.minsize(650, 400)
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="변경 이력", style="Title.TLabel").pack(anchor="w", pady=(0, 12))
@@ -2519,11 +2572,10 @@ class ScheduleApp(tk.Tk):
     def open_task_excel_import(self) -> None:
         window = tk.Toplevel(self)
         window.title("수시업무 엑셀 가져오기")
-        window.transient(self)
         window.geometry("620x230")
         window.resizable(True, True)
         window.minsize(520, 210)
-        window.grab_set()
+        prepare_modal_popup(window, self)
 
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
@@ -2648,11 +2700,10 @@ class ScheduleApp(tk.Tk):
             return
         self.import_window = tk.Toplevel(self)
         self.import_window.title("민원 엑셀 가져오기")
-        self.import_window.transient(self)
         self.import_window.geometry("1120x620")
         self.import_window.resizable(True, True)
         self.import_window.minsize(850, 480)
-        self.import_window.grab_set()
+        prepare_modal_popup(self.import_window, self)
         body = ttk.Frame(self.import_window, padding=18)
         body.pack(fill="both", expand=True)
         bar = self._toolbar(body)
@@ -2736,7 +2787,8 @@ class ScheduleApp(tk.Tk):
                 continue
             self.complaint_tree.insert(
                 "", "end", iid=str(item["id"]),
-                values=(item["receipt_no"], item["complaint_name"], item["applicant_name"], item["received_at"],
+                values=("● 있음" if str(item.get("memo", "")).strip() else "—",
+                        item["receipt_no"], item["complaint_name"], item["applicant_name"], item["received_at"],
                         item["current_deadline"], dday_text(item["current_deadline"]), "", ""),
                 tags=(urgency_tag(item["current_deadline"]),),
             )
@@ -2757,7 +2809,8 @@ class ScheduleApp(tk.Tk):
                 continue
             self.task_tree.insert(
                 "", "end", iid=str(item["id"]),
-                values=(item["title"], item["registered_at"], item["deadline"],
+                values=("● 있음" if str(item.get("content", "")).strip() else "—",
+                        item["title"], item["registered_at"], item["deadline"],
                         dday_text(item["deadline"]), item["priority"], "", ""), tags=(urgency_tag(item["deadline"]),),
             )
             self._task_progress[str(item["id"])] = (item, urgency_tag(item["deadline"]))
@@ -2777,6 +2830,20 @@ class ScheduleApp(tk.Tk):
             return 0 <= delta <= 3
         if mode == "이번 주":
             return 0 <= delta <= 7
+        if mode == "기한 초과":
+            return delta < 0
+        return True
+
+    @staticmethod
+    def _matches_dashboard_filter(deadline: str, mode: str) -> bool:
+        try:
+            delta = (parse_deadline(deadline).date() - date.today()).days
+        except ValueError:
+            return False
+        if mode == "오늘 마감":
+            return delta == 0
+        if mode == "3일 이내":
+            return 0 < delta <= 3
         if mode == "기한 초과":
             return delta < 0
         return True
@@ -2929,11 +2996,10 @@ class ScheduleApp(tk.Tk):
         editing = event is not None
         window = tk.Toplevel(self)
         window.title(f"일정 {'수정' if editing else '등록'} · {selected.isoformat()}")
-        window.transient(self)
         window.geometry("700x760")
         window.minsize(620, 650)
         window.resizable(True, True)
-        window.grab_set()
+        prepare_modal_popup(window, self)
         body = ttk.Frame(window, padding=20)
         body.pack(fill="both", expand=True)
         body.columnconfigure(1, weight=1)
@@ -3384,12 +3450,20 @@ class ScheduleApp(tk.Tk):
 
     def refresh_today(self) -> None:
         self._clear_tree(self.today_tree)
+        mode = getattr(self, "dashboard_filter", "전체")
+        if mode == "전체":
+            self.today_guidance_var.set("※ 기한 초과 및 7일 이내 업무 · 오늘의 일정")
+        else:
+            self.today_guidance_var.set(f"※ 대시보드 필터: {mode} 업무만 표시")
         for kind, item, deadline in self._active_items():
             try:
                 delta = (parse_deadline(deadline).date() - date.today()).days
             except ValueError:
                 delta = 9999
-            if delta > 7:
+            if mode == "전체":
+                if delta > 7:
+                    continue
+            elif not self._matches_dashboard_filter(deadline, mode):
                 continue
             is_complaint = kind == "민원 신청"
             self.today_tree.insert(
@@ -3398,6 +3472,8 @@ class ScheduleApp(tk.Tk):
                         deadline, dday_text(deadline), item["processing_stage"] if is_complaint else item["priority"]),
                 tags=(urgency_tag(deadline),),
             )
+        if mode != "전체":
+            return
         today_date = date.today()
         today_text = today_date.isoformat()
         today_events = self.db.calendar_events_between(today_date, today_date)
@@ -3428,7 +3504,14 @@ class ScheduleApp(tk.Tk):
         if not row_id or ":" not in row_id:
             return
         kind, item_id = row_id.split(":", 1)
-        self._show_source_item(kind, item_id)
+        if kind == "complaint":
+            self.edit_complaint_dialog(complaint_id=int(item_id))
+        elif kind == "task":
+            self.edit_task_dialog(task_id=int(item_id))
+        elif kind == "event":
+            calendar_event = self.db.calendar_event_by_id(int(item_id))
+            if calendar_event:
+                self.add_calendar_event_dialog(parse_deadline(str(calendar_event["event_date"])).date(), calendar_event)
 
     def _show_source_item(self, kind: str, item_id: str) -> None:
         if kind == "complaint":
@@ -3507,7 +3590,7 @@ class ScheduleApp(tk.Tk):
                 deltas.append((parse_deadline(value).date() - date.today()).days)
             except ValueError:
                 pass
-        self.summary_vars["민원"].set(str(len(complaints)))
+        self.summary_vars["새올민원"].set(str(len(complaints)))
         self.summary_vars["수시업무"].set(str(len(tasks)))
         today_date = date.today()
         today_event_count = len(self.db.calendar_events_between(today_date, today_date))
