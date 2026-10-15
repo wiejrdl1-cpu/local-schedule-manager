@@ -215,7 +215,12 @@ def preview_task_import(path: Path) -> list[ImportItem]:
 
 
 def apply_import(path: Path, db: Database, items: list[ImportItem]) -> dict[str, int]:
-    counts = {"new": 0, "changed": 0, "skipped": 0, "error": 0}
+    counts = {"new": 0, "changed": 0, "skipped": 0, "error": 0, "completed": 0}
+    imported_receipts = {
+        item.data.get("receipt_no", "").strip()
+        for item in items
+        if item.data.get("receipt_no", "").strip()
+    }
     for item in items:
         if item.status == "신규":
             db.add_complaint(item.data)
@@ -227,6 +232,8 @@ def apply_import(path: Path, db: Database, items: list[ImportItem]) -> dict[str,
             counts["error"] += 1
         else:
             counts["skipped"] += 1
+    if imported_receipts and counts["error"] == 0:
+        counts["completed"] = db.complete_complaints_not_in_receipts(imported_receipts)
     db.log_import(path.name, counts)
     return counts
 

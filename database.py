@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import calendar
 import os
 import shutil
 import sqlite3
 import sys
-from datetime import datetime
+import uuid
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,10 @@ def default_data_dir() -> Path:
     override = os.environ.get("DDAY_MANAGER_DATA_DIR")
     if override:
         return Path(override)
+    if getattr(sys, "frozen", False):
+        portable_dir = Path(sys.executable).resolve().parent / "data"
+        if (portable_dir / "portable.marker").exists():
+            return portable_dir
     base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
     app_dir_name = RELEASE_APP_DIR_NAME if getattr(sys, "frozen", False) else APP_DIR_NAME
     return base / app_dir_name
@@ -91,7 +97,41 @@ class Database:
                 event_time TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL,
                 schedule_type TEXT NOT NULL DEFAULT '개인일정',
+                repeat_type TEXT NOT NULL DEFAULT 'none',
+                repeat_interval INTEGER NOT NULL DEFAULT 1,
+                repeat_weekdays TEXT NOT NULL DEFAULT '',
+                repeat_month_day INTEGER NOT NULL DEFAULT 0,
+                repeat_end_date TEXT NOT NULL DEFAULT '',
                 details_enc TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_kind TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                stored_name TEXT NOT NULL UNIQUE,
+                file_size INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_attachments_entity
+                ON attachments(entity_kind, entity_id, id);
+
+            CREATE TABLE IF NOT EXISTS notification_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                message_enc TEXT NOT NULL DEFAULT '',
+                schedule_type TEXT NOT NULL,
+                notify_date TEXT NOT NULL DEFAULT '',
+                notify_time TEXT NOT NULL DEFAULT '',
+                interval_minutes INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                fixed_key TEXT NOT NULL DEFAULT '',
+                next_trigger_at TEXT NOT NULL,
+                last_triggered_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -152,7 +192,103 @@ class Database:
             self.conn.execute("ALTER TABLE calendar_events ADD COLUMN event_time TEXT NOT NULL DEFAULT ''")
         if "schedule_type" not in event_columns:
             self.conn.execute("ALTER TABLE calendar_events ADD COLUMN schedule_type TEXT NOT NULL DEFAULT '개인일정'")
+        recurrence_columns = {
+            "repeat_type": "TEXT NOT NULL DEFAULT 'none'",
+            "repeat_interval": "INTEGER NOT NULL DEFAULT 1",
+            "repeat_weekdays": "TEXT NOT NULL DEFAULT ''",
+            "repeat_month_day": "INTEGER NOT NULL DEFAULT 0",
+            "repeat_end_date": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in recurrence_columns.items():
+            if column not in event_columns:
+                self.conn.execute(f"ALTER TABLE calendar_events ADD COLUMN {column} {definition}")
+        notification_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(notification_rules)").fetchall()}
+        if "fixed_key" not in notification_columns:
+            self.conn.execute("ALTER TABLE notification_rules ADD COLUMN fixed_key TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
+
+    @property
+    def attachments_dir(self) -> Path:
+        directory = self.data_dir / "attachments"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    @staticmethod
+    def _validate_entity_kind(kind: str) -> None:
+        if kind not in {"complaint", "task", "calendar_event"}:
+            raise ValueError("지원하지 않는 첨부파일 항목입니다.")
+
+    def add_attachment(self, kind: str, item_id: int, source: Path) -> int:
+        self._validate_entity_kind(kind)
+        source = Path(source)
+        if not source.is_file():
+            raise ValueError(f"첨부할 파일을 찾을 수 없습니다: {source.name}")
+        stored_name = f"{uuid.uuid4().hex}{source.suffix}"
+        target = self.attachments_dir / stored_name
+        shutil.copy2(source, target)
+        try:
+            cursor = self.conn.execute(
+                "INSERT INTO attachments(entity_kind, entity_id, display_name, stored_name, file_size, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    kind,
+                    item_id,
+                    source.name,
+                    stored_name,
+                    target.stat().st_size,
+                    datetime.now().isoformat(timespec="seconds"),
+                ),
+            )
+            attachment_id = int(cursor.lastrowid)
+            self._log_audit(kind, item_id, "첨부파일 추가", source.name)
+            self.conn.commit()
+            return attachment_id
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+
+    def list_attachments(self, kind: str, item_id: int) -> list[dict[str, Any]]:
+        self._validate_entity_kind(kind)
+        rows = self.conn.execute(
+            "SELECT * FROM attachments WHERE entity_kind=? AND entity_id=? ORDER BY id",
+            (kind, item_id),
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["path"] = self.attachments_dir / item["stored_name"]
+            result.append(item)
+        return result
+
+    def attachment_by_id(self, attachment_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM attachments WHERE id=?", (attachment_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["path"] = self.attachments_dir / item["stored_name"]
+        return item
+
+    def delete_attachment(self, attachment_id: int) -> None:
+        attachment = self.attachment_by_id(attachment_id)
+        if not attachment:
+            return
+        self.conn.execute("DELETE FROM attachments WHERE id=?", (attachment_id,))
+        self._log_audit(
+            str(attachment["entity_kind"]),
+            int(attachment["entity_id"]),
+            "첨부파일 삭제",
+            str(attachment["display_name"]),
+        )
+        self.conn.commit()
+        Path(attachment["path"]).unlink(missing_ok=True)
+
+    def _delete_item_attachments(self, kind: str, item_id: int) -> list[Path]:
+        attachments = self.list_attachments(kind, item_id)
+        self.conn.execute(
+            "DELETE FROM attachments WHERE entity_kind=? AND entity_id=?",
+            (kind, item_id),
+        )
+        return [Path(attachment["path"]) for attachment in attachments]
 
     def _log_audit(self, kind: str, item_id: int, action: str, details: str = "") -> None:
         self.conn.execute(
@@ -176,6 +312,239 @@ class Database:
             "INSERT INTO settings(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _next_notification_at(
+        schedule_type: str,
+        notify_date: str = "",
+        notify_time: str = "",
+        interval_minutes: int = 0,
+        reference: datetime | None = None,
+    ) -> datetime:
+        now = reference or datetime.now()
+        if schedule_type == "interval":
+            if interval_minutes < 1:
+                raise ValueError("반복 간격은 1분 이상이어야 합니다.")
+            return now + timedelta(minutes=interval_minutes)
+        if schedule_type in {"weekday_overtime", "weekend_overtime"}:
+            try:
+                minute = int(notify_time)
+                if not 0 <= minute <= 59:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise ValueError("알림 분은 0분부터 59분 사이로 선택하세요.") from None
+            hours = (6, 7, 8, 9, 18, 19, 20, 21, 22, 23) if schedule_type == "weekday_overtime" else tuple(range(6, 24))
+            for day_offset in range(8):
+                candidate_date = (now + timedelta(days=day_offset)).date()
+                is_valid_day = candidate_date.weekday() < 5 if schedule_type == "weekday_overtime" else candidate_date.weekday() >= 5
+                if not is_valid_day:
+                    continue
+                for hour in hours:
+                    candidate = datetime.combine(candidate_date, datetime.min.time()).replace(hour=hour, minute=minute)
+                    if candidate > now:
+                        return candidate
+            raise ValueError("다음 알림 시각을 계산하지 못했습니다.")
+        try:
+            hour, minute = (int(value) for value in notify_time.split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise ValueError("알림 시간은 HH:MM 형식으로 입력하세요.") from None
+        if schedule_type == "daily":
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return candidate if candidate > now else candidate + timedelta(days=1)
+        if schedule_type == "once":
+            try:
+                candidate = datetime.strptime(f"{notify_date} {notify_time}", "%Y-%m-%d %H:%M")
+            except ValueError:
+                raise ValueError("1회 알림 날짜와 시간을 올바르게 입력하세요.") from None
+            if candidate <= now:
+                raise ValueError("1회 알림은 현재보다 이후 시각으로 설정하세요.")
+            return candidate
+        raise ValueError("지원하지 않는 알림 방식입니다.")
+
+    def add_notification(self, data: dict[str, Any]) -> int:
+        now = datetime.now()
+        schedule_type = str(data.get("schedule_type", "once"))
+        interval_minutes = int(data.get("interval_minutes") or 0)
+        next_at = self._next_notification_at(
+            schedule_type,
+            str(data.get("notify_date", "")),
+            str(data.get("notify_time", "")),
+            interval_minutes,
+            now,
+        )
+        cursor = self.conn.execute(
+            "INSERT INTO notification_rules(title, message_enc, schedule_type, notify_date, notify_time, "
+            "interval_minutes, enabled, fixed_key, next_trigger_at, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(data.get("title", "")).strip(),
+                self._enc(str(data.get("message", ""))),
+                schedule_type,
+                str(data.get("notify_date", "")),
+                str(data.get("notify_time", "")),
+                interval_minutes,
+                1 if data.get("enabled", True) else 0,
+                str(data.get("fixed_key", "")),
+                next_at.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def ensure_default_notifications(self) -> None:
+        defaults = (
+            {
+                "fixed_key": "weekday_overtime",
+                "title": "평일 초과근무",
+                "message": "초과근무 시간 입력",
+                "schedule_type": "weekday_overtime",
+                "notify_time": "00",
+                "enabled": True,
+            },
+            {
+                "fixed_key": "weekend_overtime",
+                "title": "주말 초과근무",
+                "message": "초과근무 시간 입력",
+                "schedule_type": "weekend_overtime",
+                "notify_time": "00",
+                "enabled": True,
+            },
+        )
+        for data in defaults:
+            exists = self.conn.execute(
+                "SELECT id, message_enc FROM notification_rules WHERE fixed_key=?",
+                (data["fixed_key"],),
+            ).fetchone()
+            if not exists:
+                self.add_notification(data)
+            else:
+                old_message = self._dec(str(exists["message_enc"]))
+                if old_message in {"평일 초과근무 내용을 확인하세요.", "주말 초과근무 내용을 확인하세요."}:
+                    self.conn.execute(
+                        "UPDATE notification_rules SET message_enc=?, updated_at=? WHERE id=?",
+                        (self._enc("초과근무 시간 입력"), datetime.now().isoformat(timespec="seconds"), int(exists["id"])),
+                    )
+                    self.conn.commit()
+
+    def list_notifications(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM notification_rules ORDER BY enabled DESC, next_trigger_at, id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["message"] = self._dec(item.pop("message_enc"))
+            result.append(item)
+        return result
+
+    def notification_by_id(self, notification_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM notification_rules WHERE id=?", (notification_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["message"] = self._dec(item.pop("message_enc"))
+        return item
+
+    def update_notification(self, notification_id: int, data: dict[str, Any]) -> None:
+        existing = self.notification_by_id(notification_id)
+        if not existing:
+            return
+        fixed_key = str(existing.get("fixed_key", ""))
+        if fixed_key:
+            data = dict(data)
+            data["title"] = existing["title"]
+            data["schedule_type"] = existing["schedule_type"]
+        now = datetime.now()
+        schedule_type = str(data.get("schedule_type", "once"))
+        interval_minutes = int(data.get("interval_minutes") or 0)
+        next_at = self._next_notification_at(
+            schedule_type,
+            str(data.get("notify_date", "")),
+            str(data.get("notify_time", "")),
+            interval_minutes,
+            now,
+        )
+        self.conn.execute(
+            "UPDATE notification_rules SET title=?, message_enc=?, schedule_type=?, notify_date=?, notify_time=?, "
+            "interval_minutes=?, enabled=?, next_trigger_at=?, updated_at=? WHERE id=?",
+            (
+                str(data.get("title", "")).strip(),
+                self._enc(str(data.get("message", ""))),
+                schedule_type,
+                str(data.get("notify_date", "")),
+                str(data.get("notify_time", "")),
+                interval_minutes,
+                1 if data.get("enabled", True) else 0,
+                next_at.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+                notification_id,
+            ),
+        )
+        self.conn.commit()
+
+    def set_notification_enabled(self, notification_id: int, enabled: bool) -> None:
+        item = self.notification_by_id(notification_id)
+        if not item:
+            return
+        next_at = item["next_trigger_at"]
+        if enabled:
+            next_at = self._next_notification_at(
+                str(item["schedule_type"]),
+                str(item["notify_date"]),
+                str(item["notify_time"]),
+                int(item["interval_minutes"]),
+            ).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE notification_rules SET enabled=?, next_trigger_at=?, updated_at=? WHERE id=?",
+            (1 if enabled else 0, next_at, datetime.now().isoformat(timespec="seconds"), notification_id),
+        )
+        self.conn.commit()
+
+    def delete_notification(self, notification_id: int) -> None:
+        item = self.notification_by_id(notification_id)
+        if item and item.get("fixed_key"):
+            raise ValueError("평일·주말 초과근무 알림은 삭제할 수 없습니다.")
+        self.conn.execute("DELETE FROM notification_rules WHERE id=?", (notification_id,))
+        self.conn.commit()
+
+    def due_notifications(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        reference = now or datetime.now()
+        rows = self.conn.execute(
+            "SELECT id FROM notification_rules WHERE enabled=1 AND next_trigger_at<=? ORDER BY next_trigger_at, id",
+            (reference.isoformat(timespec="seconds"),),
+        ).fetchall()
+        return [item for row in rows if (item := self.notification_by_id(int(row["id"]))) is not None]
+
+    def mark_notification_triggered(self, notification_id: int, now: datetime | None = None) -> None:
+        reference = now or datetime.now()
+        item = self.notification_by_id(notification_id)
+        if not item:
+            return
+        if item["schedule_type"] == "once":
+            enabled = 0
+            next_at = str(item["next_trigger_at"])
+        else:
+            enabled = 1
+            next_at = self._next_notification_at(
+                str(item["schedule_type"]),
+                str(item["notify_date"]),
+                str(item["notify_time"]),
+                int(item["interval_minutes"]),
+                reference,
+            ).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE notification_rules SET enabled=?, next_trigger_at=?, last_triggered_at=?, updated_at=? WHERE id=?",
+            (
+                enabled,
+                next_at,
+                reference.isoformat(timespec="seconds"),
+                reference.isoformat(timespec="seconds"),
+                notification_id,
+            ),
         )
         self.conn.commit()
 
@@ -487,10 +856,38 @@ class Database:
             ORDER BY completed_at DESC, kind DESC, id DESC
             """
         ).fetchall()
+        removed_attachment_paths: list[Path] = []
         for old in completed[30:]:
             old_table = "complaints" if old["kind"] == "complaint" else "tasks"
+            removed_attachment_paths.extend(self._delete_item_attachments(str(old["kind"]), int(old["id"])))
             self.conn.execute(f"DELETE FROM {old_table} WHERE id=?", (old["id"],))  # noqa: S608
         self.conn.commit()
+        for path in removed_attachment_paths:
+            path.unlink(missing_ok=True)
+
+    def complete_complaints_not_in_receipts(self, receipt_nos: set[str]) -> int:
+        """Complete active complaints that are absent from a newly imported workbook."""
+        normalized = {value.strip() for value in receipt_nos if value.strip()}
+        if not normalized:
+            return 0
+        active = self.conn.execute(
+            "SELECT id, receipt_no FROM complaints WHERE status='진행'"
+        ).fetchall()
+        missing_ids = [
+            int(row["id"])
+            for row in active
+            if str(row["receipt_no"]).strip() not in normalized
+        ]
+        for complaint_id in missing_ids:
+            self.mark_complete("complaint", complaint_id)
+            self._log_audit(
+                "complaint",
+                complaint_id,
+                "엑셀 동기화 자동 완료",
+                "새로 가져온 엑셀에 없는 민원",
+            )
+            self.conn.commit()
+        return len(missing_ids)
 
     def restore_completed(self, kind: str, item_id: int) -> None:
         table = "complaints" if kind == "complaint" else "tasks"
@@ -535,13 +932,17 @@ class Database:
             return
         table = "complaints" if kind == "complaint" else "tasks"
         placeholders = ",".join("?" for _ in item_ids)
+        removed_attachment_paths: list[Path] = []
         for item_id in item_ids:
             self._log_audit(kind, item_id, "영구 삭제")
+            removed_attachment_paths.extend(self._delete_item_attachments(kind, item_id))
         self.conn.execute(
             f"DELETE FROM {table} WHERE status='삭제' AND id IN ({placeholders})",  # noqa: S608
             tuple(item_ids),
         )
         self.conn.commit()
+        for path in removed_attachment_paths:
+            path.unlink(missing_ok=True)
 
     def extension_history(self, complaint_id: int) -> list[dict[str, str]]:
         rows = self.conn.execute(
@@ -571,12 +972,28 @@ class Database:
         details: str = "",
         event_time: str = "",
         schedule_type: str = "개인일정",
+        recurrence: dict[str, Any] | None = None,
     ) -> int:
+        rule = self._normalize_recurrence(event_date, recurrence)
         now = datetime.now().isoformat(timespec="seconds")
         cursor = self.conn.execute(
-            "INSERT INTO calendar_events(event_date, event_time, title, schedule_type, details_enc, created_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (event_date, event_time, title, schedule_type, self._enc(details), now, now),
+            "INSERT INTO calendar_events(event_date, event_time, title, schedule_type, repeat_type, repeat_interval, "
+            "repeat_weekdays, repeat_month_day, repeat_end_date, details_enc, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                event_date,
+                event_time,
+                title,
+                schedule_type,
+                rule["repeat_type"],
+                rule["repeat_interval"],
+                rule["repeat_weekdays"],
+                rule["repeat_month_day"],
+                rule["repeat_end_date"],
+                self._enc(details),
+                now,
+                now,
+            ),
         )
         event_id = int(cursor.lastrowid)
         self._log_audit("calendar_event", event_id, "일정 등록", f"{schedule_type} · {event_date}")
@@ -610,13 +1027,29 @@ class Database:
         details: str = "",
         event_time: str = "",
         schedule_type: str = "개인일정",
+        recurrence: dict[str, Any] | None = None,
     ) -> None:
         if not self.conn.execute("SELECT id FROM calendar_events WHERE id=?", (event_id,)).fetchone():
             raise ValueError("수정할 일정을 찾을 수 없습니다.")
+        rule = self._normalize_recurrence(event_date, recurrence)
         now = datetime.now().isoformat(timespec="seconds")
         self.conn.execute(
-            "UPDATE calendar_events SET event_date=?, event_time=?, title=?, schedule_type=?, details_enc=?, updated_at=? WHERE id=?",
-            (event_date, event_time, title, schedule_type, self._enc(details), now, event_id),
+            "UPDATE calendar_events SET event_date=?, event_time=?, title=?, schedule_type=?, repeat_type=?, "
+            "repeat_interval=?, repeat_weekdays=?, repeat_month_day=?, repeat_end_date=?, details_enc=?, updated_at=? WHERE id=?",
+            (
+                event_date,
+                event_time,
+                title,
+                schedule_type,
+                rule["repeat_type"],
+                rule["repeat_interval"],
+                rule["repeat_weekdays"],
+                rule["repeat_month_day"],
+                rule["repeat_end_date"],
+                self._enc(details),
+                now,
+                event_id,
+            ),
         )
         self._log_audit("calendar_event", event_id, "일정 수정", f"{schedule_type} · {event_date} {event_time}".strip())
         self.conn.commit()
@@ -625,8 +1058,116 @@ class Database:
         if not self.conn.execute("SELECT id FROM calendar_events WHERE id=?", (event_id,)).fetchone():
             return
         self._log_audit("calendar_event", event_id, "일정 삭제")
+        removed_attachment_paths = self._delete_item_attachments("calendar_event", event_id)
         self.conn.execute("DELETE FROM calendar_events WHERE id=?", (event_id,))
         self.conn.commit()
+        for path in removed_attachment_paths:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _normalize_recurrence(event_date: str, recurrence: dict[str, Any] | None) -> dict[str, Any]:
+        recurrence = recurrence or {}
+        repeat_type = str(recurrence.get("repeat_type", "none"))
+        if repeat_type not in {"none", "daily", "weekly", "monthly"}:
+            raise ValueError("반복 유형이 올바르지 않습니다.")
+        try:
+            start = date.fromisoformat(event_date)
+            interval = int(recurrence.get("repeat_interval", 1))
+            month_day = int(recurrence.get("repeat_month_day", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("반복 일정 값을 확인하세요.") from exc
+        if interval < 1:
+            raise ValueError("반복 간격은 1 이상이어야 합니다.")
+        if repeat_type == "none":
+            return {
+                "repeat_type": "none",
+                "repeat_interval": 1,
+                "repeat_weekdays": "",
+                "repeat_month_day": 0,
+                "repeat_end_date": "",
+            }
+        end_text = str(recurrence.get("repeat_end_date", "")).strip()
+        try:
+            end = date.fromisoformat(end_text)
+        except ValueError as exc:
+            raise ValueError("반복 종료일은 YYYY-MM-DD 형식으로 입력하세요.") from exc
+        if end < start:
+            raise ValueError("반복 종료일은 시작일보다 빠를 수 없습니다.")
+        weekdays_text = str(recurrence.get("repeat_weekdays", ""))
+        weekdays = sorted({int(value) for value in weekdays_text.split(",") if value != ""})
+        if any(value < 0 or value > 6 for value in weekdays):
+            raise ValueError("반복 요일을 확인하세요.")
+        if repeat_type == "weekly" and not weekdays:
+            raise ValueError("매주 반복할 요일을 하나 이상 선택하세요.")
+        if repeat_type == "monthly" and not 1 <= month_day <= 31:
+            raise ValueError("매월 반복일은 1일부터 31일 사이여야 합니다.")
+        return {
+            "repeat_type": repeat_type,
+            "repeat_interval": interval,
+            "repeat_weekdays": ",".join(str(value) for value in weekdays),
+            "repeat_month_day": month_day if repeat_type == "monthly" else 0,
+            "repeat_end_date": end.isoformat(),
+        }
+
+    def calendar_events_between(self, start_date: date, end_date: date) -> list[dict[str, Any]]:
+        if end_date < start_date:
+            return []
+        occurrences: list[dict[str, Any]] = []
+        for event in self.list_calendar_events():
+            for occurrence_date in self._occurrence_dates(event, start_date, end_date):
+                occurrence = dict(event)
+                occurrence["series_start_date"] = event["event_date"]
+                occurrence["event_date"] = occurrence_date.isoformat()
+                occurrences.append(occurrence)
+        occurrences.sort(key=lambda item: (str(item["event_date"]), str(item.get("event_time", "")), int(item["id"])))
+        return occurrences
+
+    @staticmethod
+    def _occurrence_dates(event: dict[str, Any], range_start: date, range_end: date) -> list[date]:
+        start = date.fromisoformat(str(event["event_date"]))
+        repeat_type = str(event.get("repeat_type", "none"))
+        if repeat_type == "none":
+            return [start] if range_start <= start <= range_end else []
+        repeat_end_text = str(event.get("repeat_end_date", ""))
+        repeat_end = date.fromisoformat(repeat_end_text) if repeat_end_text else start
+        first = max(start, range_start)
+        last = min(repeat_end, range_end)
+        if last < first:
+            return []
+        interval = max(1, int(event.get("repeat_interval", 1)))
+        result: list[date] = []
+        if repeat_type == "daily":
+            elapsed = (first - start).days
+            candidate = start + timedelta(days=((elapsed + interval - 1) // interval) * interval)
+            while candidate <= last:
+                result.append(candidate)
+                candidate += timedelta(days=interval)
+            return result
+        if repeat_type == "weekly":
+            weekdays = {int(value) for value in str(event.get("repeat_weekdays", "")).split(",") if value != ""}
+            candidate = first
+            start_week = start - timedelta(days=start.weekday())
+            while candidate <= last:
+                week_index = ((candidate - start_week).days // 7)
+                if week_index % interval == 0 and candidate.weekday() in weekdays:
+                    result.append(candidate)
+                candidate += timedelta(days=1)
+            return result
+        if repeat_type == "monthly":
+            month_day = int(event.get("repeat_month_day", start.day))
+            month_index = start.year * 12 + start.month - 1
+            first_index = first.year * 12 + first.month - 1
+            offset = max(0, first_index - month_index)
+            current_index = month_index + ((offset + interval - 1) // interval) * interval
+            while current_index <= last.year * 12 + last.month - 1:
+                year, zero_based_month = divmod(current_index, 12)
+                month = zero_based_month + 1
+                if month_day <= calendar.monthrange(year, month)[1]:
+                    candidate = date(year, month, month_day)
+                    if first <= candidate <= last and candidate >= start:
+                        result.append(candidate)
+                current_index += interval
+        return result
 
     def backup(self) -> Path:
         backup_dir = self.data_dir / "backups"
