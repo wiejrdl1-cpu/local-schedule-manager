@@ -5,7 +5,9 @@ import json
 import os
 import secrets
 import shutil
+import sqlite3
 import sys
+import zipfile
 import tkinter as tk
 import uuid
 from datetime import date, datetime, timedelta
@@ -15,6 +17,11 @@ from tkinter import font as tkfont
 from typing import Callable
 
 import holidays
+
+try:
+    import windnd
+except ImportError:  # 드래그앤드롭 지원 패키지가 없는 개발 환경에서도 기본 기능은 유지합니다.
+    windnd = None
 
 from database import Database
 from excel_import import (
@@ -57,28 +64,51 @@ PROGRESS_COLORS = {"completed": "#E34F4F", "current": "#3E82D7", "pending": "#C9
 
 
 def prepare_modal_popup(window: tk.Toplevel, owner: tk.Misc) -> None:
-    """Make nested popups independently closable and restore the prior modal grab."""
-    previous_grab = owner.grab_current()
-    transient_owner = previous_grab if previous_grab is not None and previous_grab is not window else owner
-    window.transient(transient_owner)
+    """Keep a popup associated with its owner without blocking the other app windows."""
+    window.transient(owner)
+    window.lift()
 
-    def restore_previous_grab(event: tk.Event) -> None:
-        if event.widget is not window or previous_grab is None:
-            return
-        try:
-            if previous_grab.winfo_exists():
-                previous_grab.grab_set()
-                previous_grab.focus_set()
-        except tk.TclError:
-            pass
 
-    window.bind("<Destroy>", restore_previous_grab, add="+")
-    window.grab_set()
+def enable_file_drop(widget: tk.Misc, callback: Callable[[list[Path]], None]) -> bool:
+    """Attach a Windows Explorer file-drop target when windnd is available."""
+    if windnd is None:
+        return False
+
+    def receive_files(values: list[bytes | str]) -> None:
+        callback([Path(os.fsdecode(value)) for value in values])
+
+    try:
+        windnd.hook_dropfiles(widget, func=receive_files)
+    except Exception:
+        return False
+    return True
 
 
 def resource_path(relative_path: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / relative_path
+
+
+def create_portable_backup_archive(db: Database, executable: Path, destination: Path) -> None:
+    executable = Path(executable)
+    destination = Path(destination)
+    if not executable.is_file():
+        raise FileNotFoundError("백업에 포함할 EasyPlanner.exe를 찾을 수 없습니다. 먼저 EXE를 빌드하세요.")
+    snapshot = db.backup()
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(executable, "EasyPlanner.exe")
+        archive.write(snapshot, "data/schedule.db")
+        archive.writestr("data/portable.marker", "간편 플래너 이동용 데이터")
+        if db.attachments_dir.exists():
+            for path in db.attachments_dir.rglob("*"):
+                if path.is_file():
+                    archive.write(path, f"data/attachments/{path.relative_to(db.attachments_dir).as_posix()}")
+        archive.writestr(
+            "사용방법.txt",
+            "이 ZIP 파일을 원하는 폴더에 모두 압축 해제한 뒤 EasyPlanner.exe를 실행하세요.\n"
+            "EXE와 data 폴더를 항상 함께 보관해야 합니다.\n"
+            "같은 Windows 사용자 계정에서는 기존 일정과 첨부파일이 바로 적용됩니다.\n",
+        )
 
 
 def parse_deadline(value: str) -> datetime:
@@ -145,6 +175,7 @@ class FormDialog(tk.Toplevel):
         self.attachment_kind = attachment_kind
         self.attachment_item_id = attachment_item_id
         self.pending_attachments: list[Path] = []
+        self.attachment_rows: list[tuple[str, object]] = []
         body = ttk.Frame(self, padding=18)
         body.grid(sticky="nsew")
         body.columnconfigure(1, weight=1)
@@ -170,13 +201,10 @@ class FormDialog(tk.Toplevel):
             self.attachment_list = tk.Listbox(attachment_panel, height=3, font=getattr(parent, "input_font", None))
             self.attachment_list.grid(row=0, column=0, columnspan=3, sticky="ew")
             ttk.Button(attachment_panel, text="파일 추가", command=self._choose_attachments).grid(row=1, column=0, sticky="w", pady=(6, 0))
-            ttk.Button(attachment_panel, text="선택 제거", command=self._remove_pending_attachment).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
-            if attachment_item_id is not None:
-                ttk.Button(
-                    attachment_panel,
-                    text="저장된 파일 관리",
-                    command=lambda: getattr(parent, "open_attachment_manager")(attachment_kind, attachment_item_id),
-                ).grid(row=1, column=2, sticky="e", pady=(6, 0))
+            ttk.Button(attachment_panel, text="파일 삭제", command=self._delete_selected_attachment).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
+            ttk.Button(attachment_panel, text="파일 다운로드", command=self._download_selected_attachment).grid(row=1, column=2, sticky="e", pady=(6, 0))
+            enable_file_drop(self.attachment_list, self._add_attachment_paths)
+            self._reload_attachment_list()
             next_row += 1
         buttons = ttk.Frame(body)
         buttons.grid(row=next_row, column=0, columnspan=2, sticky="e", pady=(14, 0))
@@ -187,20 +215,88 @@ class FormDialog(tk.Toplevel):
         self.after(50, lambda: next(iter(self.entries.values())).focus_set())
 
     def _choose_attachments(self) -> None:
-        selected = filedialog.askopenfilenames(title="첨부할 파일 선택", parent=self)
-        for value in selected:
-            path = Path(value)
-            if path not in self.pending_attachments:
-                self.pending_attachments.append(path)
-                self.attachment_list.insert("end", path.name)
+        self._add_attachment_paths(
+            [Path(value) for value in filedialog.askopenfilenames(title="첨부할 파일 선택", parent=self)]
+        )
 
-    def _remove_pending_attachment(self) -> None:
+    def _add_attachment_paths(self, paths: list[Path]) -> None:
+        for path in paths:
+            if path.is_file() and path not in self.pending_attachments:
+                self.pending_attachments.append(path)
+        self._reload_attachment_list()
+
+    def _reload_attachment_list(self) -> None:
+        if not hasattr(self, "attachment_list"):
+            return
+        self.attachment_list.delete(0, "end")
+        self.attachment_rows.clear()
+        if self.attachment_kind and self.attachment_item_id is not None:
+            for attachment in getattr(self.master, "db").list_attachments(
+                self.attachment_kind, self.attachment_item_id
+            ):
+                self.attachment_rows.append(("saved", attachment))
+                self.attachment_list.insert("end", str(attachment["display_name"]))
+        for path in self.pending_attachments:
+            self.attachment_rows.append(("pending", path))
+            self.attachment_list.insert("end", path.name)
+
+    def _selected_attachment_row(self) -> tuple[str, object] | None:
         selected = self.attachment_list.curselection()
         if not selected:
-            return
+            messagebox.showinfo("파일 선택", "먼저 첨부파일을 선택하세요.", parent=self)
+            return None
         index = int(selected[0])
-        self.attachment_list.delete(index)
-        self.pending_attachments.pop(index)
+        return self.attachment_rows[index]
+
+    def _delete_selected_attachment(self) -> None:
+        row = self._selected_attachment_row()
+        if row is None:
+            return
+        row_kind, value = row
+        if row_kind == "saved":
+            attachment = value
+            if not messagebox.askyesno(
+                "첨부파일 삭제",
+                f"'{attachment['display_name']}' 파일을 삭제할까요?\n삭제한 첨부파일은 복구할 수 없습니다.",
+                parent=self,
+            ):
+                return
+            getattr(self.master, "db").delete_attachment(int(attachment["id"]))
+        else:
+            self.pending_attachments.remove(value)
+        self._reload_attachment_list()
+
+    def _download_selected_attachment(self) -> None:
+        row = self._selected_attachment_row()
+        if row is None:
+            return
+        row_kind, value = row
+        if row_kind == "saved":
+            source = Path(value["path"])
+            display_name = str(value["display_name"])
+        else:
+            source = Path(value)
+            display_name = source.name
+        if not source.exists():
+            messagebox.showwarning("파일 없음", "첨부파일을 찾을 수 없습니다.", parent=self)
+            return
+        destination = filedialog.asksaveasfilename(
+            parent=self,
+            title="첨부파일 다운로드",
+            initialfile=display_name,
+            defaultextension=source.suffix,
+            filetypes=(("모든 파일", "*.*"),),
+        )
+        if not destination:
+            return
+        try:
+            target = Path(destination)
+            if source.resolve() != target.resolve():
+                shutil.copy2(source, target)
+        except Exception as exc:
+            messagebox.showerror("다운로드할 수 없음", str(exc), parent=self)
+            return
+        messagebox.showinfo("다운로드 완료", f"첨부파일을 저장했습니다.\n\n{destination}", parent=self)
 
     def _save(self) -> None:
         data: dict[str, str] = {}
@@ -250,6 +346,7 @@ class ScheduleApp(tk.Tk):
         self._task_progress_canvases: list[tk.Canvas] = []
         self._task_progress_buttons: list[ttk.Button] = []
         self._task_progress: dict[str, tuple[dict[str, object], str]] = {}
+        self.db.ensure_default_notifications()
         self.title(APP_TITLE)
         icon_path = resource_path("assets/app_icon.ico")
         if icon_path.exists():
@@ -264,6 +361,7 @@ class ScheduleApp(tk.Tk):
         self._build_ui()
         self.refresh_all()
         self.after(900, self._notify_due_items)
+        self.after(1200, self._check_custom_notifications)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self)
@@ -360,29 +458,63 @@ class ScheduleApp(tk.Tk):
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="© 2026 이주삼", style="Subtitle.TLabel").pack(side="right", anchor="ne")
 
+        work_summary_labels = ("새올민원", "수시업무", "7일 이내", "3일 이내", "오늘 마감", "기한 초과")
+        schedule_summary_labels = ("오늘의 일정",)
+        notification_summary_labels = ("알림 관리",)
         self.summary_vars = {
             key: tk.StringVar(value="0")
-            for key in ("새올민원", "수시업무", "오늘의 일정", "오늘 마감", "3일 이내", "기한 초과")
+            for key in (*work_summary_labels, *schedule_summary_labels, *notification_summary_labels)
         }
-        cards = ttk.Frame(root)
-        cards.pack(fill="x", pady=(18, 16))
+        dashboard_sections = ttk.Frame(root)
+        dashboard_sections.pack(fill="x", pady=(18, 16))
+        dashboard_sections.columnconfigure(0, weight=6)
+        dashboard_sections.columnconfigure(1, weight=2)
+        dashboard_sections.columnconfigure(2, weight=2)
+        work_section = ttk.LabelFrame(dashboard_sections, text="업무 처리", padding=10)
+        work_section.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        schedule_section = ttk.LabelFrame(dashboard_sections, text="일정 관리", padding=10)
+        schedule_section.grid(row=0, column=1, sticky="nsew", padx=6)
+        notification_section = ttk.LabelFrame(dashboard_sections, text="알림 관리", padding=10)
+        notification_section.grid(row=0, column=2, sticky="nsew", padx=(6, 0))
         card_value_colors = {
             "새올민원": "#202020",
             "수시업무": "#202020",
             "오늘의 일정": "#202020",
+            "알림 관리": "#6C4AB6",
             "오늘 마감": "#D74343",
             "3일 이내": "#E47D26",
+            "7일 이내": "#2A9D8F",
             "기한 초과": "#3478C5",
         }
-        for col, (label, variable) in enumerate(self.summary_vars.items()):
-            card = ttk.Frame(cards, padding=(20, 16), style="Card.TFrame")
-            last_col = len(self.summary_vars) - 1
-            card.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 5, 0 if col == last_col else 5))
-            cards.columnconfigure(col, weight=1)
+
+        display_names = {
+            "7일 이내": "7일 이내",
+            "3일 이내": "3일 이내",
+            "오늘 마감": "오늘까지",
+            "기한 초과": "기한초과",
+        }
+
+        def create_summary_card(
+            parent: tk.Misc,
+            label: str,
+            row: int = 0,
+            column: int = 0,
+            size: str = "large",
+            padx: tuple[int, int] = (0, 0),
+            pady: tuple[int, int] = (0, 0),
+        ) -> ttk.Frame:
+            value_size, label_size = ((28, 12) if size == "small" else (34, 16))
+            card = ttk.Frame(parent, padding=(6, 4) if size == "small" else (12, 8), style="Card.TFrame")
+            card.grid(row=row, column=column, sticky="nsew", padx=padx, pady=pady)
+            card.columnconfigure(0, weight=1)
+            card.rowconfigure(0, weight=1)
+            card.rowconfigure(2, weight=1)
+            content = tk.Frame(card, background="#FFFFFF")
+            content.grid(row=1, column=0, sticky="ew")
             value_label = tk.Label(
-                card,
-                textvariable=variable,
-                font=(self.ui_font, 32, "bold"),
+                content,
+                textvariable=self.summary_vars[label],
+                font=(self.ui_font, value_size, "bold"),
                 foreground=card_value_colors[label],
                 background="#FFFFFF",
                 anchor="center",
@@ -390,21 +522,53 @@ class ScheduleApp(tk.Tk):
             )
             value_label.pack(fill="x")
             name_label = tk.Label(
-                card,
-                text=label,
-                font=(self.ui_font, 16, "bold"),
+                content,
+                text=display_names.get(label, label),
+                font=(self.ui_font, label_size, "bold"),
                 foreground="#202020",
                 background="#FFFFFF",
                 anchor="center",
                 cursor="hand2",
             )
             name_label.pack(fill="x")
-            for clickable in (card, value_label, name_label):
-                if label in {"오늘 마감", "3일 이내", "기한 초과"}:
+            for clickable in (card, content, value_label, name_label):
+                if label in {"7일 이내", "3일 이내", "오늘 마감", "기한 초과"}:
                     clickable.bind("<Button-1>", lambda _event, mode=label: self.show_deadline_dashboard(mode))
                 else:
-                    destination = 1 if label == "새올민원" else 2 if label == "수시업무" else 3
+                    destination = {"새올민원": 1, "수시업무": 2, "오늘의 일정": 3, "알림 관리": 4}[label]
                     clickable.bind("<Button-1>", lambda _event, page=destination: self.show_page(page))
+            return card
+
+        work_section.rowconfigure(0, weight=1)
+        work_section.columnconfigure(0, weight=1)
+        work_layout = ttk.Frame(work_section)
+        work_layout.grid(row=0, column=0, sticky="nsew")
+        work_layout.rowconfigure(0, weight=1)
+        work_layout.columnconfigure(0, weight=1, uniform="work-half")
+        work_layout.columnconfigure(1, weight=1, uniform="work-half")
+
+        primary_panel = ttk.Frame(work_layout)
+        primary_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        primary_panel.rowconfigure(0, weight=1)
+        primary_panel.columnconfigure(0, weight=1, uniform="primary-work-card")
+        primary_panel.columnconfigure(1, weight=1, uniform="primary-work-card")
+        create_summary_card(primary_panel, "새올민원", column=0, padx=(0, 3))
+        create_summary_card(primary_panel, "수시업무", column=1, padx=(3, 0))
+
+        deadline_panel = ttk.Frame(work_layout)
+        deadline_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        for index in range(2):
+            deadline_panel.rowconfigure(index, weight=1, uniform="deadline-card")
+            deadline_panel.columnconfigure(index, weight=1, uniform="deadline-card")
+        create_summary_card(deadline_panel, "7일 이내", row=0, column=0, size="small", padx=(0, 3), pady=(0, 3))
+        create_summary_card(deadline_panel, "3일 이내", row=0, column=1, size="small", padx=(3, 0), pady=(0, 3))
+        create_summary_card(deadline_panel, "오늘 마감", row=1, column=0, size="small", padx=(0, 3), pady=(3, 0))
+        create_summary_card(deadline_panel, "기한 초과", row=1, column=1, size="small", padx=(3, 0), pady=(3, 0))
+
+        for section, label in ((schedule_section, "오늘의 일정"), (notification_section, "알림 관리")):
+            section.rowconfigure(0, weight=1)
+            section.columnconfigure(0, weight=1)
+            create_summary_card(section, label)
 
         navigation = ttk.Frame(root)
         navigation.pack(fill="x", pady=(0, 14))
@@ -415,6 +579,7 @@ class ScheduleApp(tk.Tk):
         self.complaints_tab = ttk.Frame(self.notebook, padding=12)
         self.tasks_tab = ttk.Frame(self.notebook, padding=12)
         self.calendar_tab = ttk.Frame(self.notebook, padding=12)
+        self.notifications_tab = ttk.Frame(self.notebook, padding=12)
         self.completed_tab = ttk.Frame(self.notebook, padding=12)
         self.trash_tab = ttk.Frame(self.notebook, padding=12)
         pages = (
@@ -422,7 +587,8 @@ class ScheduleApp(tk.Tk):
             (self.complaints_tab, "새올 민원 처리"),
             (self.tasks_tab, "수시업무 처리"),
             (self.calendar_tab, "월간 일정"),
-            (self.completed_tab, "완료 내역"),
+            (self.notifications_tab, "알림 관리"),
+            (self.completed_tab, "민원 및 업무 완료 내역"),
             (self.trash_tab, "휴지통"),
         )
         self.nav_buttons: list[ttk.Button] = []
@@ -437,10 +603,19 @@ class ScheduleApp(tk.Tk):
             )
             button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0 if index == len(pages) - 1 else 4))
             self.nav_buttons.append(button)
+        backup_column = len(pages)
+        navigation.columnconfigure(backup_column, weight=1)
+        ttk.Button(
+            navigation,
+            text="데이터 백업",
+            style="Nav.TButton",
+            command=self.create_portable_backup,
+        ).grid(row=0, column=backup_column, sticky="ew", padx=(4, 0))
         self._build_today_tab()
         self._build_complaints_tab()
         self._build_tasks_tab()
         self._build_calendar_tab()
+        self._build_notifications_tab()
         self._build_completed_tab()
         self._build_trash_tab()
         self.show_page(0)
@@ -1109,8 +1284,7 @@ class ScheduleApp(tk.Tk):
         ttk.Label(guidance, textvariable=self.today_guidance_var, style="Subtitle.TLabel").pack(anchor="w")
         ttk.Label(guidance, text="※ 열 제목을 드래그하면 순서를 바꿀 수 있습니다", style="Subtitle.TLabel").pack(anchor="w")
         ttk.Button(bar, text="새로고침", command=self.refresh_all).pack(side="right")
-        ttk.Button(bar, text="기본 보기", command=self.show_today_page).pack(side="right", padx=6)
-        ttk.Button(bar, text="첨부파일", command=lambda: self.open_tree_attachment_manager(self.today_tree)).pack(side="right", padx=6)
+        ttk.Button(bar, text="처리 완료", style="Accent.TButton", command=self.complete_today_items).pack(side="right", padx=6)
         self.today_tree = self._new_tree(
             self.today_tab,
             ("kind", "title", "person", "deadline", "dday", "status"),
@@ -1179,7 +1353,7 @@ class ScheduleApp(tk.Tk):
         self.task_tree = self._new_tree(
             self.tasks_tab,
             ("content_check", "title", "registered", "deadline", "dday", "priority", "progress", "progress_edit"),
-            ("업무확인", "업무 제목", "등록일", "처리기한", "남은 기간", "비고", "진행 현황", "진행 현황 수정"),
+            ("메모확인", "업무 제목", "등록일", "처리기한", "남은 기간", "비고", "진행 현황", "진행 현황 수정"),
             (80, 260, 110, 140, 90, 90, 370, 120),
         )
         self.task_tree.bind("<Double-1>", self.edit_task_dialog)
@@ -1246,9 +1420,9 @@ class ScheduleApp(tk.Tk):
         summary_header = ttk.Frame(detail_panel)
         summary_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(summary_header, textvariable=self.calendar_selected_var, style="Subtitle.TLabel", wraplength=260).pack(side="left")
-        ttk.Button(summary_header, text="삭제", command=self.delete_selected_calendar_item).pack(side="right")
-        ttk.Button(summary_header, text="수정", style="Accent.TButton", command=self.edit_selected_calendar_item).pack(side="right", padx=(0, 6))
-        ttk.Button(summary_header, text="첨부파일", command=self.open_calendar_attachment_manager).pack(side="right", padx=(0, 6))
+        ttk.Button(summary_header, text="일정삭제", command=self.delete_selected_calendar_item).pack(side="right")
+        ttk.Button(summary_header, text="일정수정", style="Accent.TButton", command=self.edit_selected_calendar_item).pack(side="right", padx=(0, 6))
+        ttk.Button(summary_header, text="첨부파일 관리", command=self.open_calendar_attachment_manager).pack(side="right", padx=(0, 6))
 
         calendar_list_panel = ttk.Frame(detail_panel)
         calendar_list_panel.grid(row=1, column=0, sticky="nsew")
@@ -1326,6 +1500,286 @@ class ScheduleApp(tk.Tk):
         )
         self.completed_tree.bind("<Double-1>", lambda _e: self.restore_completed_item())
 
+    def _build_notifications_tab(self) -> None:
+        bar = self._toolbar(self.notifications_tab)
+        guidance = ttk.Frame(bar)
+        guidance.pack(side="left")
+        ttk.Label(guidance, text="※ 프로그램이 실행 중일 때 알림 팝업이 표시됩니다.", style="Subtitle.TLabel").pack(anchor="w")
+        ttk.Button(bar, text="알림 삭제", command=self.delete_notification).pack(side="right", padx=(6, 0))
+        ttk.Button(bar, text="알림 수정", command=self.edit_notification).pack(side="right", padx=(6, 0))
+        ttk.Button(bar, text="알림 추가", style="Accent.TButton", command=self.add_notification).pack(side="right", padx=(6, 0))
+        ttk.Button(bar, text="알림 테스트", command=self.test_selected_notification).pack(side="right", padx=(6, 0))
+        self.notification_tree = self._new_tree(
+            self.notifications_tab,
+            ("enabled", "type", "schedule", "title", "message", "next"),
+            ("상태", "알림 방식", "설정", "제목", "알림 내용", "다음 알림"),
+            (70, 120, 150, 180, 420, 170),
+        )
+        self.notification_tree.tag_configure("notification_on", background="#DDF4D8", foreground="#173B23")
+        self.notification_tree.tag_configure("notification_off", background="#E5E7E6", foreground="#727875")
+        self.notification_tree.bind("<Button-1>", self._open_notification_status_dropdown, add="+")
+        self.notification_tree.bind("<Double-1>", lambda event: None if self.notification_tree.identify_column(event.x) == "#1" else self.edit_notification())
+
+    @staticmethod
+    def _notification_type_label(schedule_type: str) -> str:
+        return {
+            "once": "1회 지정 시각",
+            "daily": "매일 지정 시각",
+            "interval": "반복 간격",
+            "weekday_overtime": "평일 시간대",
+            "weekend_overtime": "주말 시간대",
+        }.get(schedule_type, schedule_type)
+
+    @staticmethod
+    def _notification_schedule_text(item: dict[str, object]) -> str:
+        if item["schedule_type"] == "once":
+            return f"{item['notify_date']} {item['notify_time']}"
+        if item["schedule_type"] == "daily":
+            return f"매일 {item['notify_time']}"
+        if item["schedule_type"] == "weekday_overtime":
+            return f"평일 06~09시·18~23시 / 매시 {int(item['notify_time']):02d}분"
+        if item["schedule_type"] == "weekend_overtime":
+            return f"주말 06~23시 / 매시 {int(item['notify_time']):02d}분"
+        return f"{item['interval_minutes']}분마다"
+
+    def _selected_notification_id(self) -> int | None:
+        selected = self.notification_tree.selection()
+        if not selected:
+            messagebox.showwarning("알림 선택", "알림을 먼저 선택하세요.", parent=self)
+            return None
+        return int(selected[0])
+
+    def _open_notification_status_dropdown(self, event: tk.Event) -> str | None:
+        if self.notification_tree.identify_region(event.x, event.y) != "cell":
+            return None
+        if self.notification_tree.identify_column(event.x) != "#1":
+            return None
+        row_id = self.notification_tree.identify_row(event.y)
+        if not row_id:
+            return None
+        bounds = self.notification_tree.bbox(row_id, "#1")
+        if not bounds:
+            return None
+        previous = getattr(self, "_notification_status_editor", None)
+        if previous is not None and previous.winfo_exists():
+            previous.destroy()
+        self.notification_tree.selection_set(row_id)
+        self.notification_tree.focus(row_id)
+        item = self.db.notification_by_id(int(row_id))
+        if not item:
+            return "break"
+        x, y, width, height = bounds
+        value = tk.StringVar(value="사용" if item["enabled"] else "꺼짐")
+        editor = ttk.Combobox(
+            self.notification_tree,
+            textvariable=value,
+            values=("사용", "꺼짐"),
+            state="readonly",
+            justify="center",
+        )
+        self._notification_status_editor = editor
+        editor.place(x=x + 1, y=y + 1, width=max(60, width - 2), height=max(24, height - 2))
+        editor.focus_set()
+
+        def apply_status(_event: tk.Event | None = None) -> None:
+            try:
+                self.db.set_notification_enabled(int(row_id), value.get() == "사용")
+            except ValueError as exc:
+                messagebox.showerror("알림 상태 변경 실패", str(exc), parent=self)
+            if editor.winfo_exists():
+                editor.destroy()
+            self.refresh_notifications()
+            self.refresh_summary()
+
+        editor.bind("<<ComboboxSelected>>", apply_status)
+        editor.bind("<Escape>", lambda _event: editor.destroy())
+        editor.bind("<FocusOut>", lambda _event: self.after(150, lambda: editor.destroy() if editor.winfo_exists() else None))
+        editor.after_idle(
+            lambda: editor.event_generate(
+                "<Button-1>",
+                x=max(2, editor.winfo_width() - 8),
+                y=max(2, editor.winfo_height() // 2),
+            )
+        )
+        return "break"
+
+    def add_notification(self) -> None:
+        self.open_notification_dialog()
+
+    def edit_notification(self) -> None:
+        notification_id = self._selected_notification_id()
+        if notification_id is not None:
+            self.open_notification_dialog(notification_id)
+
+    def open_notification_dialog(self, notification_id: int | None = None) -> None:
+        item = self.db.notification_by_id(notification_id) if notification_id is not None else None
+        is_fixed = bool(item and item.get("fixed_key"))
+        window = tk.Toplevel(self)
+        window.title("알림 수정" if item else "알림 추가")
+        window.geometry("600x450")
+        window.minsize(540, 420)
+        prepare_modal_popup(window, self)
+        body = ttk.Frame(window, padding=18)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+
+        title_var = tk.StringVar(value=str(item["title"]) if item else "")
+        type_names = ("1회 지정 시각", "매일 지정 시각", "반복 간격")
+        type_by_name = {"1회 지정 시각": "once", "매일 지정 시각": "daily", "반복 간격": "interval"}
+        initial_type = self._notification_type_label(str(item["schedule_type"])) if item and not is_fixed else type_names[0]
+        type_var = tk.StringVar(value=initial_type)
+        date_var = tk.StringVar(value=str(item["notify_date"]) if item else date.today().isoformat())
+        notify_time = str(item["notify_time"]) if item and item["notify_time"] and not is_fixed else "09:00"
+        hour_var = tk.StringVar(value=notify_time.split(":")[0])
+        minute_var = tk.StringVar(value=notify_time.split(":")[1])
+        fixed_minute_var = tk.StringVar(value=f"{int(item['notify_time']):02d}" if is_fixed else "00")
+        interval_var = tk.StringVar(value=str(item["interval_minutes"]) if item and int(item["interval_minutes"]) else "60")
+        enabled_var = tk.BooleanVar(value=bool(item["enabled"]) if item else True)
+
+        ttk.Label(body, text="알림 제목 *").grid(row=0, column=0, sticky="w", padx=(0, 12), pady=7)
+        title_entry = ttk.Entry(body, textvariable=title_var, state="readonly" if is_fixed else "normal")
+        title_entry.grid(row=0, column=1, sticky="ew", pady=7)
+        ttk.Label(body, text="알림 내용 *").grid(row=1, column=0, sticky="nw", padx=(0, 12), pady=7)
+        message_text = tk.Text(body, height=6, wrap="word", font=self.input_font)
+        message_text.grid(row=1, column=1, sticky="nsew", pady=7)
+        message_text.insert("1.0", str(item["message"]) if item else "")
+        body.rowconfigure(1, weight=1)
+
+        fixed_frame = ttk.Frame(body)
+        if is_fixed:
+            ttk.Label(body, text="고정 시간대").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=7)
+            ttk.Label(body, text=self._notification_schedule_text({**item, "notify_time": 0}), style="Subtitle.TLabel").grid(row=2, column=1, sticky="w", pady=7)
+            ttk.Label(fixed_frame, text="매시").pack(side="left")
+            ttk.Combobox(
+                fixed_frame,
+                textvariable=fixed_minute_var,
+                values=tuple(f"{value:02d}" for value in range(60)),
+                state="readonly",
+                width=5,
+            ).pack(side="left", padx=8)
+            ttk.Label(fixed_frame, text="분에 알림").pack(side="left")
+            fixed_frame.grid(row=3, column=1, sticky="w", pady=7)
+        else:
+            ttk.Label(body, text="알림 방식 *").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=7)
+            type_combo = ttk.Combobox(body, textvariable=type_var, values=type_names, state="readonly")
+            type_combo.grid(row=2, column=1, sticky="ew", pady=7)
+
+        once_frame = ttk.Frame(body)
+        date_label = ttk.Label(once_frame, text="날짜")
+        date_entry = ttk.Entry(once_frame, textvariable=date_var, width=14)
+        date_label.pack(side="left")
+        date_entry.pack(side="left", padx=(8, 18))
+        time_label = ttk.Label(once_frame, text="시간")
+        time_label.pack(side="left")
+        ttk.Combobox(once_frame, textvariable=hour_var, values=tuple(f"{value:02d}" for value in range(24)), state="readonly", width=4).pack(side="left", padx=(8, 2))
+        ttk.Label(once_frame, text=":").pack(side="left")
+        ttk.Combobox(once_frame, textvariable=minute_var, values=tuple(f"{value:02d}" for value in range(60)), state="readonly", width=4).pack(side="left", padx=(2, 0))
+
+        interval_frame = ttk.Frame(body)
+        ttk.Label(interval_frame, text="반복 간격").pack(side="left")
+        ttk.Entry(interval_frame, textvariable=interval_var, width=8).pack(side="left", padx=8)
+        ttk.Label(interval_frame, text="분마다").pack(side="left")
+        ttk.Checkbutton(body, text="이 알림 사용", variable=enabled_var).grid(row=4, column=1, sticky="w", pady=7)
+
+        def update_schedule_fields(*_args: object) -> None:
+            if is_fixed:
+                return
+            once_frame.grid_remove()
+            interval_frame.grid_remove()
+            if type_var.get() == "반복 간격":
+                interval_frame.grid(row=3, column=1, sticky="w", pady=7)
+            else:
+                if type_var.get() == "1회 지정 시각":
+                    date_label.pack(side="left", before=time_label)
+                    date_entry.pack(side="left", padx=(8, 18), before=time_label)
+                else:
+                    date_label.pack_forget()
+                    date_entry.pack_forget()
+                once_frame.grid(row=3, column=1, sticky="w", pady=7)
+
+        if not is_fixed:
+            type_combo.bind("<<ComboboxSelected>>", update_schedule_fields)
+            update_schedule_fields()
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=5, column=0, columnspan=2, sticky="e", pady=(16, 0))
+
+        def save() -> None:
+            title = title_var.get().strip()
+            message = message_text.get("1.0", "end-1c").strip()
+            if not title or not message:
+                messagebox.showwarning("입력 확인", "알림 제목과 내용을 입력하세요.", parent=window)
+                return
+            try:
+                schedule_type = str(item["schedule_type"]) if is_fixed else type_by_name[type_var.get()]
+                interval = int(interval_var.get()) if schedule_type == "interval" else 0
+                saved_time = fixed_minute_var.get() if is_fixed else f"{hour_var.get()}:{minute_var.get()}"
+                data = {
+                    "title": title,
+                    "message": message,
+                    "schedule_type": schedule_type,
+                    "notify_date": date_var.get().strip(),
+                    "notify_time": saved_time,
+                    "interval_minutes": interval,
+                    "enabled": enabled_var.get(),
+                }
+                if notification_id is None:
+                    self.db.add_notification(data)
+                else:
+                    self.db.update_notification(notification_id, data)
+            except (ValueError, TypeError) as exc:
+                messagebox.showerror("알림 저장 실패", str(exc), parent=window)
+                return
+            window.destroy()
+            self.refresh_notifications()
+            self.refresh_summary()
+
+        ttk.Button(buttons, text="저장", style="Accent.TButton", command=save).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="닫기", command=window.destroy).pack(side="left")
+
+    def delete_notification(self) -> None:
+        notification_id = self._selected_notification_id()
+        if notification_id is None:
+            return
+        item = self.db.notification_by_id(notification_id)
+        if item and messagebox.askyesno("알림 삭제", f"'{item['title']}' 알림을 삭제할까요?", parent=self):
+            try:
+                self.db.delete_notification(notification_id)
+            except ValueError as exc:
+                messagebox.showinfo("고정 알림", str(exc), parent=self)
+                return
+            self.refresh_notifications()
+            self.refresh_summary()
+
+    def test_selected_notification(self) -> None:
+        notification_id = self._selected_notification_id()
+        if notification_id is None:
+            return
+        item = self.db.notification_by_id(notification_id)
+        if item:
+            self._show_custom_notification(str(item["title"]), str(item["message"]))
+
+    def create_portable_backup(self) -> None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        selected = filedialog.asksaveasfilename(
+            title="데이터 백업 저장",
+            defaultextension=".zip",
+            filetypes=(("ZIP 압축파일", "*.zip"),),
+            initialfile=f"간편플래너_데이터백업_{stamp}.zip",
+            parent=self,
+        )
+        if not selected:
+            return
+        project_dir = Path(__file__).resolve().parent
+        executable = Path(sys.executable) if getattr(sys, "frozen", False) else project_dir / "dist" / "EasyPlanner.exe"
+        try:
+            create_portable_backup_archive(self.db, executable, Path(selected))
+        except (OSError, zipfile.BadZipFile) as exc:
+            Path(selected).unlink(missing_ok=True)
+            messagebox.showerror("백업 실패", f"ZIP 백업을 만들지 못했습니다.\n{exc}", parent=self)
+            return
+        messagebox.showinfo("백업 완료", "실행 파일과 모든 일정·업무·첨부파일이 ZIP 파일 하나에 저장되었습니다.", parent=self)
+
     def _build_trash_tab(self) -> None:
         bar = self._toolbar(self.trash_tab)
         guidance = ttk.Frame(bar)
@@ -1371,7 +1825,7 @@ class ScheduleApp(tk.Tk):
         fields = [
             ("title", "업무 제목 *", ""), ("registered_at", "등록일 *", today),
             ("deadline", f"처리기한 * ({DATE_HINT})", today), ("priority", "비고", ""),
-            ("content", "업무 내용", ""),
+            ("content", "메모", ""),
         ]
 
         def save(data: dict[str, str]) -> int:
@@ -1465,13 +1919,19 @@ class ScheduleApp(tk.Tk):
                 )
 
         def add_files() -> None:
-            selected_paths = filedialog.askopenfilenames(title="첨부할 파일 선택", parent=window)
+            add_paths(
+                [Path(value) for value in filedialog.askopenfilenames(title="첨부할 파일 선택", parent=window)]
+            )
+
+        def add_paths(selected_paths: list[Path]) -> None:
             errors = []
-            for value in selected_paths:
+            for path in selected_paths:
+                if not path.is_file():
+                    continue
                 try:
-                    self.db.add_attachment(kind, item_id, Path(value))
+                    self.db.add_attachment(kind, item_id, path)
                 except Exception as exc:
-                    errors.append(f"{Path(value).name}: {exc}")
+                    errors.append(f"{path.name}: {exc}")
             refresh()
             if errors:
                 messagebox.showwarning("일부 파일 추가 실패", "\n".join(errors), parent=window)
@@ -1538,11 +1998,12 @@ class ScheduleApp(tk.Tk):
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(12, 0))
         ttk.Button(actions, text="파일 추가", style="Accent.TButton", command=add_files).pack(side="left")
-        ttk.Button(actions, text="선택 파일 열기", command=open_file).pack(side="left", padx=6)
-        ttk.Button(actions, text="선택 파일 다운로드", command=download_file).pack(side="left")
-        ttk.Button(actions, text="선택 파일 삭제", command=delete_file).pack(side="left", padx=6)
+        ttk.Button(actions, text="파일 열기", command=open_file).pack(side="left", padx=6)
+        ttk.Button(actions, text="파일 다운로드", command=download_file).pack(side="left")
+        ttk.Button(actions, text="파일 삭제", command=delete_file).pack(side="left", padx=6)
         ttk.Button(actions, text="닫기", command=window.destroy).pack(side="right")
         tree.bind("<Double-1>", lambda _event: open_file())
+        enable_file_drop(tree, add_paths)
         refresh()
 
     def edit_complaint_dialog(self, event: tk.Event | None = None, complaint_id: int | None = None) -> None:
@@ -1591,12 +2052,97 @@ class ScheduleApp(tk.Tk):
         body.rowconfigure(row, weight=1)
         row += 1
 
-        ttk.Label(body, text="첨부파일").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
-        ttk.Button(
-            body,
-            text="첨부파일 추가·열기·다운로드·삭제",
-            command=lambda: self.open_attachment_manager("complaint", complaint_id),
-        ).grid(row=row, column=1, sticky="w", pady=5)
+        pending_attachments: list[Path] = []
+        attachment_rows: list[tuple[str, object]] = []
+        ttk.Label(body, text="첨부파일").grid(row=row, column=0, sticky="nw", padx=(0, 12), pady=5)
+        attachment_panel = ttk.Frame(body)
+        attachment_panel.grid(row=row, column=1, sticky="ew", pady=5)
+        attachment_panel.columnconfigure(0, weight=1)
+        attachment_list = tk.Listbox(attachment_panel, height=3, font=self.input_font)
+        attachment_list.grid(row=0, column=0, columnspan=3, sticky="ew")
+
+        def refresh_attachment_list() -> None:
+            attachment_list.delete(0, "end")
+            attachment_rows.clear()
+            for attachment in self.db.list_attachments("complaint", complaint_id):
+                attachment_rows.append(("saved", attachment))
+                attachment_list.insert("end", str(attachment["display_name"]))
+            for path in pending_attachments:
+                attachment_rows.append(("pending", path))
+                attachment_list.insert("end", path.name)
+
+        def add_attachment_paths(paths: list[Path]) -> None:
+            for path in paths:
+                if path.is_file() and path not in pending_attachments:
+                    pending_attachments.append(path)
+            refresh_attachment_list()
+
+        def choose_attachments() -> None:
+            add_attachment_paths(
+                [Path(value) for value in filedialog.askopenfilenames(title="첨부할 파일 선택", parent=window)]
+            )
+
+        def selected_attachment_row() -> tuple[str, object] | None:
+            selected_rows = attachment_list.curselection()
+            if not selected_rows:
+                messagebox.showinfo("파일 선택", "먼저 첨부파일을 선택하세요.", parent=window)
+                return None
+            return attachment_rows[int(selected_rows[0])]
+
+        def delete_attachment() -> None:
+            selected_row = selected_attachment_row()
+            if selected_row is None:
+                return
+            row_kind, value = selected_row
+            if row_kind == "saved":
+                if not messagebox.askyesno(
+                    "첨부파일 삭제",
+                    f"'{value['display_name']}' 파일을 삭제할까요?\n삭제한 첨부파일은 복구할 수 없습니다.",
+                    parent=window,
+                ):
+                    return
+                self.db.delete_attachment(int(value["id"]))
+            else:
+                pending_attachments.remove(value)
+            refresh_attachment_list()
+
+        def download_attachment() -> None:
+            selected_row = selected_attachment_row()
+            if selected_row is None:
+                return
+            row_kind, value = selected_row
+            if row_kind == "saved":
+                source = Path(value["path"])
+                display_name = str(value["display_name"])
+            else:
+                source = Path(value)
+                display_name = source.name
+            if not source.exists():
+                messagebox.showwarning("파일 없음", "첨부파일을 찾을 수 없습니다.", parent=window)
+                return
+            destination = filedialog.asksaveasfilename(
+                parent=window,
+                title="첨부파일 다운로드",
+                initialfile=display_name,
+                defaultextension=source.suffix,
+                filetypes=(("모든 파일", "*.*"),),
+            )
+            if not destination:
+                return
+            try:
+                target = Path(destination)
+                if source.resolve() != target.resolve():
+                    shutil.copy2(source, target)
+            except Exception as exc:
+                messagebox.showerror("다운로드할 수 없음", str(exc), parent=window)
+                return
+            messagebox.showinfo("다운로드 완료", f"첨부파일을 저장했습니다.\n\n{destination}", parent=window)
+
+        ttk.Button(attachment_panel, text="파일 추가", command=choose_attachments).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(attachment_panel, text="파일 삭제", command=delete_attachment).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Button(attachment_panel, text="파일 다운로드", command=download_attachment).grid(row=1, column=2, sticky="e", pady=(6, 0))
+        enable_file_drop(attachment_list, add_attachment_paths)
+        refresh_attachment_list()
         row += 1
 
         buttons = ttk.Frame(body)
@@ -1625,7 +2171,20 @@ class ScheduleApp(tk.Tk):
             except Exception as exc:
                 messagebox.showerror("수정할 수 없음", str(exc), parent=window)
                 return
+            attachment_errors = []
+            for path in pending_attachments:
+                try:
+                    self.db.add_attachment("complaint", complaint_id, path)
+                except Exception as exc:
+                    attachment_errors.append(f"{path.name}: {exc}")
             self.refresh_all()
+            if attachment_errors:
+                messagebox.showwarning(
+                    "일부 첨부파일 저장 실패",
+                    "민원은 저장됐지만 다음 파일을 첨부하지 못했습니다.\n\n"
+                    + "\n".join(attachment_errors),
+                    parent=window,
+                )
             window.destroy()
 
         ttk.Button(buttons, text="취소", command=window.destroy).pack(side="right", padx=(8, 0))
@@ -1649,7 +2208,7 @@ class ScheduleApp(tk.Tk):
             ("registered_at", "등록일 *", task["registered_at"]),
             ("deadline", f"처리기한 * ({DATE_HINT})", task["deadline"]),
             ("priority", "비고", task["priority"]),
-            ("content", "업무 내용", task["content"]),
+            ("content", "메모", task["content"]),
         ]
 
         def save(data: dict[str, str]) -> None:
@@ -2678,6 +3237,7 @@ class ScheduleApp(tk.Tk):
                 f"신규 등록 {counts['new']}건\n"
                 f"처리기한 갱신 {counts['changed']}건\n"
                 f"기존과 동일 {counts['skipped']}건\n"
+                f"완료 내역으로 이동 {counts['completed']}건\n"
                 f"오류 {counts['error']}건\n\n"
                 "새올 민원 처리 화면에 자동 반영했습니다."
             ),
@@ -2751,7 +3311,8 @@ class ScheduleApp(tk.Tk):
             return
         messagebox.showinfo(
             "엑셀 등록 완료",
-            f"신규 {counts['new']}건\n변경 {counts['changed']}건\n중복 {counts['skipped']}건\n오류 {counts['error']}건",
+            f"신규 {counts['new']}건\n변경 {counts['changed']}건\n중복 {counts['skipped']}건\n"
+            f"완료 내역으로 이동 {counts['completed']}건\n오류 {counts['error']}건",
             parent=self,
         )
         self.import_button.configure(state="disabled")
@@ -2770,6 +3331,7 @@ class ScheduleApp(tk.Tk):
         self.refresh_tasks()
         self.refresh_today()
         self.refresh_calendar()
+        self.refresh_notifications()
         self.refresh_completed()
         self.refresh_trash()
         self.refresh_summary()
@@ -2844,6 +3406,8 @@ class ScheduleApp(tk.Tk):
             return delta == 0
         if mode == "3일 이내":
             return 0 < delta <= 3
+        if mode == "7일 이내":
+            return 3 < delta <= 7
         if mode == "기한 초과":
             return delta < 0
         return True
@@ -2877,7 +3441,7 @@ class ScheduleApp(tk.Tk):
             if task.get("priority"):
                 task_details.append(f"비고: {task['priority']}")
             if task.get("content"):
-                task_details.append(f"업무 내용: {task['content']}")
+                task_details.append(f"메모: {task['content']}")
             items.append(
                 {
                     "kind": "task",
@@ -3141,6 +3705,7 @@ class ScheduleApp(tk.Tk):
         details.grid(row=8, column=1, sticky="nsew", pady=6)
 
         pending_attachments: list[Path] = []
+        attachment_rows: list[tuple[str, object]] = []
         ttk.Label(body, text="첨부파일").grid(row=9, column=0, sticky="nw", padx=(0, 12), pady=6)
         attachment_panel = ttk.Frame(body)
         attachment_panel.grid(row=9, column=1, sticky="ew", pady=6)
@@ -3148,28 +3713,89 @@ class ScheduleApp(tk.Tk):
         attachment_list = tk.Listbox(attachment_panel, height=2, font=self.input_font)
         attachment_list.grid(row=0, column=0, columnspan=3, sticky="ew")
 
-        def choose_attachments() -> None:
-            for value in filedialog.askopenfilenames(title="첨부할 파일 선택", parent=window):
-                path = Path(value)
-                if path not in pending_attachments:
-                    pending_attachments.append(path)
-                    attachment_list.insert("end", path.name)
+        def refresh_attachment_list() -> None:
+            attachment_list.delete(0, "end")
+            attachment_rows.clear()
+            if editing:
+                for attachment in self.db.list_attachments("calendar_event", int(event["id"])):
+                    attachment_rows.append(("saved", attachment))
+                    attachment_list.insert("end", str(attachment["display_name"]))
+            for path in pending_attachments:
+                attachment_rows.append(("pending", path))
+                attachment_list.insert("end", path.name)
 
-        def remove_pending_attachment() -> None:
+        def add_attachment_paths(paths: list[Path]) -> None:
+            for path in paths:
+                if path.is_file() and path not in pending_attachments:
+                    pending_attachments.append(path)
+            refresh_attachment_list()
+
+        def choose_attachments() -> None:
+            add_attachment_paths(
+                [Path(value) for value in filedialog.askopenfilenames(title="첨부할 파일 선택", parent=window)]
+            )
+
+        def selected_attachment_row() -> tuple[str, object] | None:
             selected_rows = attachment_list.curselection()
-            if selected_rows:
-                index = int(selected_rows[0])
-                attachment_list.delete(index)
-                pending_attachments.pop(index)
+            if not selected_rows:
+                messagebox.showinfo("파일 선택", "먼저 첨부파일을 선택하세요.", parent=window)
+                return None
+            return attachment_rows[int(selected_rows[0])]
+
+        def delete_attachment() -> None:
+            row = selected_attachment_row()
+            if row is None:
+                return
+            row_kind, value = row
+            if row_kind == "saved":
+                if not messagebox.askyesno(
+                    "첨부파일 삭제",
+                    f"'{value['display_name']}' 파일을 삭제할까요?\n삭제한 첨부파일은 복구할 수 없습니다.",
+                    parent=window,
+                ):
+                    return
+                self.db.delete_attachment(int(value["id"]))
+            else:
+                pending_attachments.remove(value)
+            refresh_attachment_list()
+
+        def download_attachment() -> None:
+            row = selected_attachment_row()
+            if row is None:
+                return
+            row_kind, value = row
+            if row_kind == "saved":
+                source = Path(value["path"])
+                display_name = str(value["display_name"])
+            else:
+                source = Path(value)
+                display_name = source.name
+            if not source.exists():
+                messagebox.showwarning("파일 없음", "첨부파일을 찾을 수 없습니다.", parent=window)
+                return
+            destination = filedialog.asksaveasfilename(
+                parent=window,
+                title="첨부파일 다운로드",
+                initialfile=display_name,
+                defaultextension=source.suffix,
+                filetypes=(("모든 파일", "*.*"),),
+            )
+            if not destination:
+                return
+            try:
+                target = Path(destination)
+                if source.resolve() != target.resolve():
+                    shutil.copy2(source, target)
+            except Exception as exc:
+                messagebox.showerror("다운로드할 수 없음", str(exc), parent=window)
+                return
+            messagebox.showinfo("다운로드 완료", f"첨부파일을 저장했습니다.\n\n{destination}", parent=window)
 
         ttk.Button(attachment_panel, text="파일 추가", command=choose_attachments).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(attachment_panel, text="선택 제거", command=remove_pending_attachment).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
-        if editing:
-            ttk.Button(
-                attachment_panel,
-                text="저장된 파일 관리",
-                command=lambda: self.open_attachment_manager("calendar_event", int(event["id"])),
-            ).grid(row=1, column=2, sticky="e", pady=(6, 0))
+        ttk.Button(attachment_panel, text="파일 삭제", command=delete_attachment).grid(row=1, column=1, sticky="w", padx=6, pady=(6, 0))
+        ttk.Button(attachment_panel, text="파일 다운로드", command=download_attachment).grid(row=1, column=2, sticky="e", pady=(6, 0))
+        enable_file_drop(attachment_list, add_attachment_paths)
+        refresh_attachment_list()
 
         def save() -> None:
             title = title_var.get().strip()
@@ -3513,6 +4139,35 @@ class ScheduleApp(tk.Tk):
             if calendar_event:
                 self.add_calendar_event_dialog(parse_deadline(str(calendar_event["event_date"])).date(), calendar_event)
 
+    def complete_today_items(self) -> None:
+        selected = self.today_tree.selection()
+        if not selected:
+            messagebox.showinfo("항목 선택", "완료 처리할 민원이나 업무를 선택하세요.", parent=self)
+            return
+        work_items: list[tuple[str, int]] = []
+        for row_id in selected:
+            if ":" not in row_id:
+                continue
+            kind, item_id = row_id.split(":", 1)
+            if kind in {"complaint", "task"}:
+                work_items.append((kind, int(item_id)))
+        if not work_items:
+            messagebox.showinfo(
+                "처리 완료",
+                "일정은 처리 완료 대상이 아닙니다. 민원이나 수시업무를 선택하세요.",
+                parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "처리 완료",
+            f"선택한 민원·수시업무 {len(work_items)}건을 완료 내역으로 옮길까요?",
+            parent=self,
+        ):
+            return
+        for kind, item_id in work_items:
+            self.db.mark_complete(kind, item_id)
+        self.refresh_all()
+
     def _show_source_item(self, kind: str, item_id: str) -> None:
         if kind == "complaint":
             self.complaint_search.set("")
@@ -3597,7 +4252,110 @@ class ScheduleApp(tk.Tk):
         self.summary_vars["오늘의 일정"].set(str(today_event_count))
         self.summary_vars["오늘 마감"].set(str(sum(delta == 0 for delta in deltas)))
         self.summary_vars["3일 이내"].set(str(sum(0 < delta <= 3 for delta in deltas)))
+        self.summary_vars["7일 이내"].set(str(sum(3 < delta <= 7 for delta in deltas)))
         self.summary_vars["기한 초과"].set(str(sum(delta < 0 for delta in deltas)))
+        self.summary_vars["알림 관리"].set(str(sum(bool(item["enabled"]) for item in self.db.list_notifications())))
+
+    def refresh_notifications(self) -> None:
+        if not hasattr(self, "notification_tree"):
+            return
+        self._clear_tree(self.notification_tree)
+        for item in self.db.list_notifications():
+            next_text = str(item["next_trigger_at"]).replace("T", " ")[:16] if item["enabled"] else "—"
+            self.notification_tree.insert(
+                "",
+                "end",
+                iid=str(item["id"]),
+                values=(
+                    "사용 ▼" if item["enabled"] else "꺼짐 ▼",
+                    self._notification_type_label(str(item["schedule_type"])),
+                    self._notification_schedule_text(item),
+                    item["title"],
+                    item["message"],
+                    next_text,
+                ),
+                tags=("notification_on" if item["enabled"] else "notification_off",),
+            )
+
+    def _show_custom_notification(self, title: str, message: str) -> None:
+        show_windows_notification(f"{APP_TITLE} - {title}", message)
+        window = tk.Toplevel(self)
+        window.title(f"알림 - {title}")
+        popup_width, popup_height = 540, 320
+        screen_x = max(0, (window.winfo_screenwidth() - popup_width) // 2)
+        screen_y = max(0, (window.winfo_screenheight() - popup_height) // 2)
+        window.geometry(f"{popup_width}x{popup_height}+{screen_x}+{screen_y}")
+        window.minsize(480, 280)
+        prepare_modal_popup(window, self)
+        window.configure(background="#D75442")
+        window.attributes("-topmost", True)
+        body = tk.Frame(
+            window,
+            background="#FFF6D8",
+            highlightbackground="#D75442",
+            highlightcolor="#D75442",
+            highlightthickness=5,
+            padx=28,
+            pady=24,
+        )
+        body.pack(fill="both", expand=True)
+        tk.Label(
+            body,
+            text="●  알림",
+            font=(self.ui_font, 14, "bold"),
+            foreground="#C53A2B",
+            background="#FFF6D8",
+        ).pack(anchor="w")
+        tk.Label(
+            body,
+            text=title,
+            font=(self.ui_font, 23, "bold"),
+            foreground="#27352A",
+            background="#FFF6D8",
+            wraplength=460,
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+        tk.Label(
+            body,
+            text=message,
+            font=(self.ui_font, 15, "bold"),
+            foreground="#70451F",
+            background="#FFF6D8",
+            wraplength=460,
+            justify="left",
+        ).pack(anchor="w", fill="both", expand=True, pady=(18, 14))
+        tk.Button(
+            body,
+            text="확인",
+            command=window.destroy,
+            font=(self.ui_font, 12, "bold"),
+            foreground="#FFFFFF",
+            background="#D75442",
+            activebackground="#B83B2D",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            padx=28,
+            pady=8,
+            cursor="hand2",
+        ).pack(anchor="e")
+        try:
+            self.bell()
+        except tk.TclError:
+            pass
+        window.lift()
+        window.focus_force()
+
+    def _check_custom_notifications(self) -> None:
+        try:
+            for item in self.db.due_notifications():
+                self.db.mark_notification_triggered(int(item["id"]))
+                self._show_custom_notification(str(item["title"]), str(item["message"]))
+            self.refresh_notifications()
+            self.refresh_summary()
+        except (tk.TclError, sqlite3.Error, ValueError):
+            pass
+        if self.winfo_exists():
+            self.after(15000, self._check_custom_notifications)
 
     def _notify_due_items(self) -> None:
         today_count = int(self.summary_vars["오늘 마감"].get())

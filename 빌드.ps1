@@ -24,7 +24,7 @@ if ($InstallDependencies) {
 }
 
 try {
-    & $BuildPython -c "import PyInstaller, cryptography, holidays, openpyxl, pandas, xlrd"
+    & $BuildPython -c "import PyInstaller, cryptography, holidays, openpyxl, pandas, xlrd, windnd"
 } catch {
     throw 'Build dependencies are missing. Run this script with -InstallDependencies first.'
 }
@@ -42,6 +42,7 @@ try {
         --collect-data 'holidays' `
         --paths '.vendor' `
         --hidden-import 'xlrd' `
+        --hidden-import 'windnd' `
         app.py
     if ($LASTEXITCODE -ne 0) {
         throw "EXE build failed with exit code $LASTEXITCODE"

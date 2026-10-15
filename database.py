@@ -21,6 +21,10 @@ def default_data_dir() -> Path:
     override = os.environ.get("DDAY_MANAGER_DATA_DIR")
     if override:
         return Path(override)
+    if getattr(sys, "frozen", False):
+        portable_dir = Path(sys.executable).resolve().parent / "data"
+        if (portable_dir / "portable.marker").exists():
+            return portable_dir
     base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
     app_dir_name = RELEASE_APP_DIR_NAME if getattr(sys, "frozen", False) else APP_DIR_NAME
     return base / app_dir_name
@@ -116,6 +120,22 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_attachments_entity
                 ON attachments(entity_kind, entity_id, id);
 
+            CREATE TABLE IF NOT EXISTS notification_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                message_enc TEXT NOT NULL DEFAULT '',
+                schedule_type TEXT NOT NULL,
+                notify_date TEXT NOT NULL DEFAULT '',
+                notify_time TEXT NOT NULL DEFAULT '',
+                interval_minutes INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                fixed_key TEXT NOT NULL DEFAULT '',
+                next_trigger_at TEXT NOT NULL,
+                last_triggered_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS deadline_extensions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 complaint_id INTEGER NOT NULL,
@@ -182,6 +202,9 @@ class Database:
         for column, definition in recurrence_columns.items():
             if column not in event_columns:
                 self.conn.execute(f"ALTER TABLE calendar_events ADD COLUMN {column} {definition}")
+        notification_columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(notification_rules)").fetchall()}
+        if "fixed_key" not in notification_columns:
+            self.conn.execute("ALTER TABLE notification_rules ADD COLUMN fixed_key TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
 
     @property
@@ -289,6 +312,239 @@ class Database:
             "INSERT INTO settings(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
+        )
+        self.conn.commit()
+
+    @staticmethod
+    def _next_notification_at(
+        schedule_type: str,
+        notify_date: str = "",
+        notify_time: str = "",
+        interval_minutes: int = 0,
+        reference: datetime | None = None,
+    ) -> datetime:
+        now = reference or datetime.now()
+        if schedule_type == "interval":
+            if interval_minutes < 1:
+                raise ValueError("반복 간격은 1분 이상이어야 합니다.")
+            return now + timedelta(minutes=interval_minutes)
+        if schedule_type in {"weekday_overtime", "weekend_overtime"}:
+            try:
+                minute = int(notify_time)
+                if not 0 <= minute <= 59:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise ValueError("알림 분은 0분부터 59분 사이로 선택하세요.") from None
+            hours = (6, 7, 8, 9, 18, 19, 20, 21, 22, 23) if schedule_type == "weekday_overtime" else tuple(range(6, 24))
+            for day_offset in range(8):
+                candidate_date = (now + timedelta(days=day_offset)).date()
+                is_valid_day = candidate_date.weekday() < 5 if schedule_type == "weekday_overtime" else candidate_date.weekday() >= 5
+                if not is_valid_day:
+                    continue
+                for hour in hours:
+                    candidate = datetime.combine(candidate_date, datetime.min.time()).replace(hour=hour, minute=minute)
+                    if candidate > now:
+                        return candidate
+            raise ValueError("다음 알림 시각을 계산하지 못했습니다.")
+        try:
+            hour, minute = (int(value) for value in notify_time.split(":"))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise ValueError("알림 시간은 HH:MM 형식으로 입력하세요.") from None
+        if schedule_type == "daily":
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return candidate if candidate > now else candidate + timedelta(days=1)
+        if schedule_type == "once":
+            try:
+                candidate = datetime.strptime(f"{notify_date} {notify_time}", "%Y-%m-%d %H:%M")
+            except ValueError:
+                raise ValueError("1회 알림 날짜와 시간을 올바르게 입력하세요.") from None
+            if candidate <= now:
+                raise ValueError("1회 알림은 현재보다 이후 시각으로 설정하세요.")
+            return candidate
+        raise ValueError("지원하지 않는 알림 방식입니다.")
+
+    def add_notification(self, data: dict[str, Any]) -> int:
+        now = datetime.now()
+        schedule_type = str(data.get("schedule_type", "once"))
+        interval_minutes = int(data.get("interval_minutes") or 0)
+        next_at = self._next_notification_at(
+            schedule_type,
+            str(data.get("notify_date", "")),
+            str(data.get("notify_time", "")),
+            interval_minutes,
+            now,
+        )
+        cursor = self.conn.execute(
+            "INSERT INTO notification_rules(title, message_enc, schedule_type, notify_date, notify_time, "
+            "interval_minutes, enabled, fixed_key, next_trigger_at, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(data.get("title", "")).strip(),
+                self._enc(str(data.get("message", ""))),
+                schedule_type,
+                str(data.get("notify_date", "")),
+                str(data.get("notify_time", "")),
+                interval_minutes,
+                1 if data.get("enabled", True) else 0,
+                str(data.get("fixed_key", "")),
+                next_at.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
+    def ensure_default_notifications(self) -> None:
+        defaults = (
+            {
+                "fixed_key": "weekday_overtime",
+                "title": "평일 초과근무",
+                "message": "초과근무 시간 입력",
+                "schedule_type": "weekday_overtime",
+                "notify_time": "00",
+                "enabled": True,
+            },
+            {
+                "fixed_key": "weekend_overtime",
+                "title": "주말 초과근무",
+                "message": "초과근무 시간 입력",
+                "schedule_type": "weekend_overtime",
+                "notify_time": "00",
+                "enabled": True,
+            },
+        )
+        for data in defaults:
+            exists = self.conn.execute(
+                "SELECT id, message_enc FROM notification_rules WHERE fixed_key=?",
+                (data["fixed_key"],),
+            ).fetchone()
+            if not exists:
+                self.add_notification(data)
+            else:
+                old_message = self._dec(str(exists["message_enc"]))
+                if old_message in {"평일 초과근무 내용을 확인하세요.", "주말 초과근무 내용을 확인하세요."}:
+                    self.conn.execute(
+                        "UPDATE notification_rules SET message_enc=?, updated_at=? WHERE id=?",
+                        (self._enc("초과근무 시간 입력"), datetime.now().isoformat(timespec="seconds"), int(exists["id"])),
+                    )
+                    self.conn.commit()
+
+    def list_notifications(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM notification_rules ORDER BY enabled DESC, next_trigger_at, id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["message"] = self._dec(item.pop("message_enc"))
+            result.append(item)
+        return result
+
+    def notification_by_id(self, notification_id: int) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT * FROM notification_rules WHERE id=?", (notification_id,)).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["message"] = self._dec(item.pop("message_enc"))
+        return item
+
+    def update_notification(self, notification_id: int, data: dict[str, Any]) -> None:
+        existing = self.notification_by_id(notification_id)
+        if not existing:
+            return
+        fixed_key = str(existing.get("fixed_key", ""))
+        if fixed_key:
+            data = dict(data)
+            data["title"] = existing["title"]
+            data["schedule_type"] = existing["schedule_type"]
+        now = datetime.now()
+        schedule_type = str(data.get("schedule_type", "once"))
+        interval_minutes = int(data.get("interval_minutes") or 0)
+        next_at = self._next_notification_at(
+            schedule_type,
+            str(data.get("notify_date", "")),
+            str(data.get("notify_time", "")),
+            interval_minutes,
+            now,
+        )
+        self.conn.execute(
+            "UPDATE notification_rules SET title=?, message_enc=?, schedule_type=?, notify_date=?, notify_time=?, "
+            "interval_minutes=?, enabled=?, next_trigger_at=?, updated_at=? WHERE id=?",
+            (
+                str(data.get("title", "")).strip(),
+                self._enc(str(data.get("message", ""))),
+                schedule_type,
+                str(data.get("notify_date", "")),
+                str(data.get("notify_time", "")),
+                interval_minutes,
+                1 if data.get("enabled", True) else 0,
+                next_at.isoformat(timespec="seconds"),
+                now.isoformat(timespec="seconds"),
+                notification_id,
+            ),
+        )
+        self.conn.commit()
+
+    def set_notification_enabled(self, notification_id: int, enabled: bool) -> None:
+        item = self.notification_by_id(notification_id)
+        if not item:
+            return
+        next_at = item["next_trigger_at"]
+        if enabled:
+            next_at = self._next_notification_at(
+                str(item["schedule_type"]),
+                str(item["notify_date"]),
+                str(item["notify_time"]),
+                int(item["interval_minutes"]),
+            ).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE notification_rules SET enabled=?, next_trigger_at=?, updated_at=? WHERE id=?",
+            (1 if enabled else 0, next_at, datetime.now().isoformat(timespec="seconds"), notification_id),
+        )
+        self.conn.commit()
+
+    def delete_notification(self, notification_id: int) -> None:
+        item = self.notification_by_id(notification_id)
+        if item and item.get("fixed_key"):
+            raise ValueError("평일·주말 초과근무 알림은 삭제할 수 없습니다.")
+        self.conn.execute("DELETE FROM notification_rules WHERE id=?", (notification_id,))
+        self.conn.commit()
+
+    def due_notifications(self, now: datetime | None = None) -> list[dict[str, Any]]:
+        reference = now or datetime.now()
+        rows = self.conn.execute(
+            "SELECT id FROM notification_rules WHERE enabled=1 AND next_trigger_at<=? ORDER BY next_trigger_at, id",
+            (reference.isoformat(timespec="seconds"),),
+        ).fetchall()
+        return [item for row in rows if (item := self.notification_by_id(int(row["id"]))) is not None]
+
+    def mark_notification_triggered(self, notification_id: int, now: datetime | None = None) -> None:
+        reference = now or datetime.now()
+        item = self.notification_by_id(notification_id)
+        if not item:
+            return
+        if item["schedule_type"] == "once":
+            enabled = 0
+            next_at = str(item["next_trigger_at"])
+        else:
+            enabled = 1
+            next_at = self._next_notification_at(
+                str(item["schedule_type"]),
+                str(item["notify_date"]),
+                str(item["notify_time"]),
+                int(item["interval_minutes"]),
+                reference,
+            ).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE notification_rules SET enabled=?, next_trigger_at=?, last_triggered_at=?, updated_at=? WHERE id=?",
+            (
+                enabled,
+                next_at,
+                reference.isoformat(timespec="seconds"),
+                reference.isoformat(timespec="seconds"),
+                notification_id,
+            ),
         )
         self.conn.commit()
 
@@ -608,6 +864,30 @@ class Database:
         self.conn.commit()
         for path in removed_attachment_paths:
             path.unlink(missing_ok=True)
+
+    def complete_complaints_not_in_receipts(self, receipt_nos: set[str]) -> int:
+        """Complete active complaints that are absent from a newly imported workbook."""
+        normalized = {value.strip() for value in receipt_nos if value.strip()}
+        if not normalized:
+            return 0
+        active = self.conn.execute(
+            "SELECT id, receipt_no FROM complaints WHERE status='진행'"
+        ).fetchall()
+        missing_ids = [
+            int(row["id"])
+            for row in active
+            if str(row["receipt_no"]).strip() not in normalized
+        ]
+        for complaint_id in missing_ids:
+            self.mark_complete("complaint", complaint_id)
+            self._log_audit(
+                "complaint",
+                complaint_id,
+                "엑셀 동기화 자동 완료",
+                "새로 가져온 엑셀에 없는 민원",
+            )
+            self.conn.commit()
+        return len(missing_ids)
 
     def restore_completed(self, kind: str, item_id: int) -> None:
         table = "complaints" if kind == "complaint" else "tasks"

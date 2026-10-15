@@ -6,13 +6,14 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import date, timedelta
+import zipfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 
-from app import ScheduleApp
+from app import ScheduleApp, create_portable_backup_archive
 from database import Database, RELEASE_APP_DIR_NAME, default_data_dir
 from excel_import import (
     TASK_TEMPLATE_EXAMPLE_TITLE,
@@ -41,6 +42,16 @@ class CoreFlowTests(unittest.TestCase):
             os.environ.pop("DDAY_MANAGER_DATA_DIR", None)
             with patch.object(sys, "frozen", True, create=True):
                 self.assertEqual(default_data_dir(), self.root / RELEASE_APP_DIR_NAME)
+
+    def test_packaged_app_prefers_portable_data_beside_executable(self) -> None:
+        executable = self.root / "EasyPlanner.exe"
+        portable = self.root / "data"
+        portable.mkdir()
+        (portable / "portable.marker").write_text("portable", encoding="utf-8")
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(self.root / "local")}, clear=False):
+            os.environ.pop("DDAY_MANAGER_DATA_DIR", None)
+            with patch.object(sys, "frozen", True, create=True), patch.object(sys, "executable", str(executable)):
+                self.assertEqual(default_data_dir(), portable)
 
     def _write_excel(
         self,
@@ -84,6 +95,47 @@ class CoreFlowTests(unittest.TestCase):
         self.assertEqual(complaint["applicant_name"], "가상민원인")
         self.assertEqual(len(self.db.extension_history(complaint["id"])), 1)
 
+    def test_import_completes_active_complaints_missing_from_new_workbook(self) -> None:
+        self.db.add_complaint(
+            {
+                "receipt_no": "R-OLD-001",
+                "complaint_name": "이전 엑셀에만 있던 민원",
+                "received_at": "2026-08-01",
+                "deadline": "2026-08-20",
+            }
+        )
+        path = self._write_excel()
+        items = preview_import(path, self.db)
+        counts = apply_import(path, self.db, items)
+        self.assertEqual(counts["completed"], 1)
+        completed = [
+            item
+            for item in self.db.list_complaints(include_completed=True)
+            if item["receipt_no"] == "R-OLD-001"
+        ]
+        self.assertEqual(completed[0]["status"], "완료")
+
+    def test_import_with_errors_does_not_auto_complete_existing_complaints(self) -> None:
+        self.db.add_complaint(
+            {
+                "receipt_no": "R-KEEP-001",
+                "complaint_name": "유지되어야 하는 민원",
+                "received_at": "2026-08-01",
+                "deadline": "2026-08-20",
+            }
+        )
+        path = self.root / "오류민원.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["접수번호", "민원명", "받은일자", "처리기한"])
+        sheet.append(["R-ERROR-001", "", "2026-08-10", "2026-08-20"])
+        workbook.save(path)
+        items = preview_import(path, self.db)
+        counts = apply_import(path, self.db, items)
+        self.assertEqual(counts["error"], 1)
+        self.assertEqual(counts["completed"], 0)
+        self.assertEqual(self.db.complaint_by_receipt_no("R-KEEP-001")["status"], "진행")
+
     def test_sensitive_values_are_not_plaintext_in_database(self) -> None:
         self.db.add_task(
             {
@@ -113,6 +165,84 @@ class CoreFlowTests(unittest.TestCase):
         backup = self.db.backup()
         self.assertTrue(backup.exists())
         self.assertGreater(backup.stat().st_size, 0)
+
+    def test_portable_backup_contains_executable_database_and_attachments(self) -> None:
+        executable = self.root / "EasyPlanner.exe"
+        executable.write_bytes(b"sample-executable")
+        attachment = self.root / "sample.txt"
+        attachment.write_text("attachment", encoding="utf-8")
+        task_id = self.db.add_task(
+            {"title": "백업 시험", "registered_at": "2026-10-15", "deadline": "2026-10-20"}
+        )
+        self.db.add_attachment("task", task_id, attachment)
+        target = self.root / "portable.zip"
+        create_portable_backup_archive(self.db, executable, target)
+        with zipfile.ZipFile(target) as archive:
+            names = set(archive.namelist())
+        self.assertIn("EasyPlanner.exe", names)
+        self.assertIn("data/schedule.db", names)
+        self.assertIn("data/portable.marker", names)
+        self.assertTrue(any(name.startswith("data/attachments/") for name in names))
+
+    def test_notification_schedules_and_marks_triggers(self) -> None:
+        reference = datetime(2026, 10, 15, 9, 0, 0)
+        with patch("database.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = reference
+            mocked_datetime.strptime = datetime.strptime
+            notification_id = self.db.add_notification(
+                {
+                    "title": "서류 확인",
+                    "message": "민원 서류를 확인하세요.",
+                    "schedule_type": "interval",
+                    "interval_minutes": 30,
+                    "enabled": True,
+                }
+            )
+        item = self.db.notification_by_id(notification_id)
+        self.assertEqual(item["message"], "민원 서류를 확인하세요.")
+        self.assertEqual(item["next_trigger_at"], "2026-10-15T09:30:00")
+        due_time = datetime(2026, 10, 15, 9, 30, 0)
+        self.assertEqual([value["id"] for value in self.db.due_notifications(due_time)], [notification_id])
+        self.db.mark_notification_triggered(notification_id, due_time)
+        self.assertEqual(self.db.notification_by_id(notification_id)["next_trigger_at"], "2026-10-15T10:00:00")
+
+    def test_fixed_overtime_notifications_are_seeded_once_and_cannot_be_deleted(self) -> None:
+        self.db.ensure_default_notifications()
+        self.db.ensure_default_notifications()
+        items = self.db.list_notifications()
+        fixed = [item for item in items if item["fixed_key"]]
+        self.assertEqual({item["title"] for item in fixed}, {"평일 초과근무", "주말 초과근무"})
+        self.assertEqual({item["message"] for item in fixed}, {"초과근무 시간 입력"})
+        self.assertEqual(len(fixed), 2)
+        with self.assertRaisesRegex(ValueError, "삭제할 수 없습니다"):
+            self.db.delete_notification(int(fixed[0]["id"]))
+
+        customized = fixed[0]
+        self.db.update_notification(
+            int(customized["id"]),
+            {
+                **customized,
+                "message": "사용자가 지정한 알림 문구",
+                "enabled": True,
+            },
+        )
+        self.db.ensure_default_notifications()
+        self.assertEqual(
+            self.db.notification_by_id(int(customized["id"]))["message"],
+            "사용자가 지정한 알림 문구",
+        )
+
+    def test_fixed_overtime_notification_time_windows(self) -> None:
+        weekday_reference = datetime(2026, 10, 16, 9, 20, 0)  # Friday
+        weekday_next = Database._next_notification_at(
+            "weekday_overtime", notify_time="15", reference=weekday_reference
+        )
+        self.assertEqual(weekday_next, datetime(2026, 10, 16, 18, 15, 0))
+        weekend_reference = datetime(2026, 10, 17, 23, 20, 0)  # Saturday
+        weekend_next = Database._next_notification_at(
+            "weekend_overtime", notify_time="15", reference=weekend_reference
+        )
+        self.assertEqual(weekend_next, datetime(2026, 10, 18, 6, 15, 0))
 
     def test_processing_stage_change_is_recorded(self) -> None:
         complaint_id = self.db.add_complaint(
@@ -436,6 +566,15 @@ class CoreFlowTests(unittest.TestCase):
         )
         self.assertFalse(
             ScheduleApp._matches_dashboard_filter((today + timedelta(days=4)).isoformat(), "3일 이내")
+        )
+        self.assertTrue(
+            ScheduleApp._matches_dashboard_filter((today + timedelta(days=4)).isoformat(), "7일 이내")
+        )
+        self.assertTrue(
+            ScheduleApp._matches_dashboard_filter((today + timedelta(days=7)).isoformat(), "7일 이내")
+        )
+        self.assertFalse(
+            ScheduleApp._matches_dashboard_filter((today + timedelta(days=3)).isoformat(), "7일 이내")
         )
         self.assertTrue(
             ScheduleApp._matches_dashboard_filter((today - timedelta(days=1)).isoformat(), "기한 초과")
