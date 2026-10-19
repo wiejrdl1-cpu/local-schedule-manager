@@ -36,7 +36,7 @@ try {
         --clean `
         --onefile `
         --windowed `
-        --name 'EasyPlanner' `
+        --name 'Task It Easy' `
         --icon 'assets\app_icon.ico' `
         --add-data 'assets\app_icon.ico;assets' `
         --collect-data 'holidays' `
@@ -51,7 +51,7 @@ try {
     Pop-Location
 }
 
-$ExePath = Join-Path $ProjectDir 'dist\EasyPlanner.exe'
+$ExePath = Join-Path $ProjectDir 'dist\Task It Easy.exe'
 if (-not (Test-Path -LiteralPath $ExePath)) {
     throw 'The built EXE file was not found.'
 }

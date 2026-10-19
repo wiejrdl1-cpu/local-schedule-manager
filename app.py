@@ -36,7 +36,8 @@ from notifications import show_windows_notification
 from security import InvalidPasswordError
 
 
-APP_TITLE = "간편 플래너"
+APP_TITLE = "Task It Easy"
+EXECUTABLE_NAME = "Task It Easy.exe"
 DATE_HINT = "YYYY-MM-DD 또는 YYYY-MM-DD HH:MM"
 PALETTE = {
     "background": "#F4FBEF",
@@ -93,19 +94,19 @@ def create_portable_backup_archive(db: Database, executable: Path, destination: 
     executable = Path(executable)
     destination = Path(destination)
     if not executable.is_file():
-        raise FileNotFoundError("백업에 포함할 EasyPlanner.exe를 찾을 수 없습니다. 먼저 EXE를 빌드하세요.")
+        raise FileNotFoundError(f"백업에 포함할 {EXECUTABLE_NAME}를 찾을 수 없습니다. 먼저 EXE를 빌드하세요.")
     snapshot = db.backup()
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(executable, "EasyPlanner.exe")
+        archive.write(executable, EXECUTABLE_NAME)
         archive.write(snapshot, "data/schedule.db")
-        archive.writestr("data/portable.marker", "간편 플래너 이동용 데이터")
+        archive.writestr("data/portable.marker", "Task It Easy 이동용 데이터")
         if db.attachments_dir.exists():
             for path in db.attachments_dir.rglob("*"):
                 if path.is_file():
                     archive.write(path, f"data/attachments/{path.relative_to(db.attachments_dir).as_posix()}")
         archive.writestr(
             "사용방법.txt",
-            "이 ZIP 파일을 원하는 폴더에 모두 압축 해제한 뒤 EasyPlanner.exe를 실행하세요.\n"
+            f"이 ZIP 파일을 원하는 폴더에 모두 압축 해제한 뒤 {EXECUTABLE_NAME}를 실행하세요.\n"
             "EXE와 data 폴더를 항상 함께 보관해야 합니다.\n"
             "같은 Windows 사용자 계정에서는 기존 일정과 첨부파일이 바로 적용됩니다.\n",
         )
@@ -371,6 +372,14 @@ class ScheduleApp(tk.Tk):
             (name for name in ("NanumGothic", "나눔고딕", "Arial Rounded MT Bold", "맑은 고딕") if name in installed_fonts),
             "맑은 고딕",
         )
+        self.brand_font = next(
+            (
+                name
+                for name in ("Arial Rounded MT Bold", "Segoe UI Black", "Franklin Gothic Heavy", "Arial Black")
+                if name in installed_fonts
+            ),
+            self.ui_font,
+        )
         self.input_font = tkfont.Font(self, family=self.ui_font, size=10, weight="normal")
         for named_font in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
             try:
@@ -420,6 +429,12 @@ class ScheduleApp(tk.Tk):
         style.configure("TLabelframe", background=PALETTE["surface"], bordercolor=PALETTE["border"])
         style.configure("TLabelframe.Label", font=(self.ui_font, 10, "bold"), background=PALETTE["background"], foreground=PALETTE["green_dark"])
         style.configure("Title.TLabel", font=(self.ui_font, 25, "bold"), foreground=PALETTE["green_dark"])
+        style.configure(
+            "Brand.TLabel",
+            font=(self.brand_font, 44, "bold"),
+            foreground="#24324A",
+            background=PALETTE["background"],
+        )
         style.configure("Subtitle.TLabel", font=(self.ui_font, 12, "bold"), foreground="#465B4B")
         style.configure("Card.TFrame", background="#FFFFFF", relief="solid", borderwidth=1, bordercolor="#C8D0C5")
         style.configure("CardValueBlack.TLabel", font=(self.ui_font, 32, "bold"), foreground="#202020", background="#FFFFFF")
@@ -455,8 +470,15 @@ class ScheduleApp(tk.Tk):
         root.pack(fill="both", expand=True)
         header = ttk.Frame(root)
         header.pack(fill="x")
-        ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="© 2026 이주삼", style="Subtitle.TLabel").pack(side="right", anchor="ne")
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(2, weight=1)
+        ttk.Label(header, text=APP_TITLE, style="Brand.TLabel").grid(row=0, column=1, pady=(0, 4))
+        ttk.Label(header, text="© 2026 이주삼", style="Subtitle.TLabel").grid(
+            row=0,
+            column=2,
+            sticky="ne",
+            pady=(4, 0),
+        )
 
         work_summary_labels = ("새올민원", "수시업무", "7일 이내", "3일 이내", "오늘 마감", "기한 초과")
         schedule_summary_labels = ("오늘의 일정",)
@@ -1537,10 +1559,16 @@ class ScheduleApp(tk.Tk):
         if item["schedule_type"] == "daily":
             return f"매일 {item['notify_time']}"
         if item["schedule_type"] == "weekday_overtime":
-            return f"평일 06~09시·18~23시 / 매시 {int(item['notify_time']):02d}분"
+            return f"평일 00~09시·18~23시 / 매시 {int(item['notify_time']):02d}분"
         if item["schedule_type"] == "weekend_overtime":
-            return f"주말 06~23시 / 매시 {int(item['notify_time']):02d}분"
+            return f"주말 00~23시 / 매시 {int(item['notify_time']):02d}분"
         return f"{item['interval_minutes']}분마다"
+
+    @staticmethod
+    def _fixed_notification_window_text(schedule_type: str) -> str:
+        if schedule_type == "weekday_overtime":
+            return "평일 00~09시·18~23시"
+        return "주말 00~23시"
 
     def _selected_notification_id(self) -> int | None:
         selected = self.notification_tree.selection()
@@ -1648,7 +1676,11 @@ class ScheduleApp(tk.Tk):
         fixed_frame = ttk.Frame(body)
         if is_fixed:
             ttk.Label(body, text="고정 시간대").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=7)
-            ttk.Label(body, text=self._notification_schedule_text({**item, "notify_time": 0}), style="Subtitle.TLabel").grid(row=2, column=1, sticky="w", pady=7)
+            ttk.Label(
+                body,
+                text=self._fixed_notification_window_text(str(item["schedule_type"])),
+                style="Subtitle.TLabel",
+            ).grid(row=2, column=1, sticky="w", pady=7)
             ttk.Label(fixed_frame, text="매시").pack(side="left")
             ttk.Combobox(
                 fixed_frame,
@@ -1765,13 +1797,13 @@ class ScheduleApp(tk.Tk):
             title="데이터 백업 저장",
             defaultextension=".zip",
             filetypes=(("ZIP 압축파일", "*.zip"),),
-            initialfile=f"간편플래너_데이터백업_{stamp}.zip",
+            initialfile=f"Task_It_Easy_데이터백업_{stamp}.zip",
             parent=self,
         )
         if not selected:
             return
         project_dir = Path(__file__).resolve().parent
-        executable = Path(sys.executable) if getattr(sys, "frozen", False) else project_dir / "dist" / "EasyPlanner.exe"
+        executable = Path(sys.executable) if getattr(sys, "frozen", False) else project_dir / "dist" / EXECUTABLE_NAME
         try:
             create_portable_backup_archive(self.db, executable, Path(selected))
         except (OSError, zipfile.BadZipFile) as exc:
@@ -4278,72 +4310,69 @@ class ScheduleApp(tk.Tk):
             )
 
     def _show_custom_notification(self, title: str, message: str) -> None:
-        show_windows_notification(f"{APP_TITLE} - {title}", message)
+        show_windows_notification(APP_TITLE, message)
         window = tk.Toplevel(self)
-        window.title(f"알림 - {title}")
-        popup_width, popup_height = 540, 320
+        window.title(APP_TITLE)
+        popup_width, popup_height = 520, 260
         screen_x = max(0, (window.winfo_screenwidth() - popup_width) // 2)
         screen_y = max(0, (window.winfo_screenheight() - popup_height) // 2)
         window.geometry(f"{popup_width}x{popup_height}+{screen_x}+{screen_y}")
-        window.minsize(480, 280)
+        window.resizable(False, False)
         prepare_modal_popup(window, self)
-        window.configure(background="#D75442")
+        window.configure(background="#E8ECF8")
         window.attributes("-topmost", True)
         body = tk.Frame(
             window,
-            background="#FFF6D8",
-            highlightbackground="#D75442",
-            highlightcolor="#D75442",
-            highlightthickness=5,
-            padx=28,
-            pady=24,
+            background="#FFFFFF",
+            highlightbackground="#D8DEEF",
+            highlightcolor="#D8DEEF",
+            highlightthickness=1,
+            padx=38,
+            pady=30,
         )
-        body.pack(fill="both", expand=True)
+        body.pack(fill="both", expand=True, padx=10, pady=10)
+        time_var = tk.StringVar(value=datetime.now().strftime("%H:%M"))
         tk.Label(
             body,
-            text="●  알림",
-            font=(self.ui_font, 14, "bold"),
-            foreground="#C53A2B",
-            background="#FFF6D8",
-        ).pack(anchor="w")
-        tk.Label(
-            body,
-            text=title,
-            font=(self.ui_font, 23, "bold"),
-            foreground="#27352A",
-            background="#FFF6D8",
-            wraplength=460,
-            justify="left",
-        ).pack(anchor="w", pady=(10, 0))
+            textvariable=time_var,
+            font=(self.ui_font, 34, "bold"),
+            foreground="#4F46E5",
+            background="#FFFFFF",
+        ).pack(pady=(14, 18))
+        tk.Frame(body, background="#E2E8F0", height=1).pack(fill="x", padx=58)
         tk.Label(
             body,
             text=message,
-            font=(self.ui_font, 15, "bold"),
-            foreground="#70451F",
-            background="#FFF6D8",
-            wraplength=460,
-            justify="left",
-        ).pack(anchor="w", fill="both", expand=True, pady=(18, 14))
-        tk.Button(
-            body,
-            text="확인",
-            command=window.destroy,
-            font=(self.ui_font, 12, "bold"),
-            foreground="#FFFFFF",
-            background="#D75442",
-            activebackground="#B83B2D",
-            activeforeground="#FFFFFF",
-            relief="flat",
-            padx=28,
-            pady=8,
-            cursor="hand2",
-        ).pack(anchor="e")
+            font=(self.ui_font, 17, "bold"),
+            foreground="#1E293B",
+            background="#FFFFFF",
+            wraplength=420,
+            justify="center",
+        ).pack(fill="both", expand=True, pady=(22, 12))
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.bind("<Return>", lambda _event: window.destroy())
         try:
             self.bell()
         except tk.TclError:
             pass
         window.lift()
         window.focus_force()
+
+        def update_clock() -> None:
+            if not window.winfo_exists():
+                return
+            time_var.set(datetime.now().strftime("%H:%M"))
+            window.after(1000, update_clock)
+
+        def keep_on_top() -> None:
+            if not window.winfo_exists():
+                return
+            window.attributes("-topmost", True)
+            window.lift()
+            window.after(1000, keep_on_top)
+
+        window.after(250, keep_on_top)
+        window.after(1000, update_clock)
 
     def _check_custom_notifications(self) -> None:
         try:

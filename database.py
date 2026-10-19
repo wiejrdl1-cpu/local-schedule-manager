@@ -335,7 +335,11 @@ class Database:
                     raise ValueError
             except (ValueError, TypeError):
                 raise ValueError("알림 분은 0분부터 59분 사이로 선택하세요.") from None
-            hours = (6, 7, 8, 9, 18, 19, 20, 21, 22, 23) if schedule_type == "weekday_overtime" else tuple(range(6, 24))
+            hours = (
+                (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 18, 19, 20, 21, 22, 23)
+                if schedule_type == "weekday_overtime"
+                else tuple(range(24))
+            )
             for day_offset in range(8):
                 candidate_date = (now + timedelta(days=day_offset)).date()
                 is_valid_day = candidate_date.weekday() < 5 if schedule_type == "weekday_overtime" else candidate_date.weekday() >= 5
@@ -402,7 +406,7 @@ class Database:
             {
                 "fixed_key": "weekday_overtime",
                 "title": "평일 초과근무",
-                "message": "초과근무 시간 입력",
+                "message": "초과 근무를 입력하세요",
                 "schedule_type": "weekday_overtime",
                 "notify_time": "00",
                 "enabled": True,
@@ -410,7 +414,7 @@ class Database:
             {
                 "fixed_key": "weekend_overtime",
                 "title": "주말 초과근무",
-                "message": "초과근무 시간 입력",
+                "message": "초과 근무를 입력하세요",
                 "schedule_type": "weekend_overtime",
                 "notify_time": "00",
                 "enabled": True,
@@ -425,12 +429,43 @@ class Database:
                 self.add_notification(data)
             else:
                 old_message = self._dec(str(exists["message_enc"]))
-                if old_message in {"평일 초과근무 내용을 확인하세요.", "주말 초과근무 내용을 확인하세요."}:
+                if old_message in {
+                    "평일 초과근무 내용을 확인하세요.",
+                    "주말 초과근무 내용을 확인하세요.",
+                    "초과근무 시간 입력",
+                }:
                     self.conn.execute(
                         "UPDATE notification_rules SET message_enc=?, updated_at=? WHERE id=?",
-                        (self._enc("초과근무 시간 입력"), datetime.now().isoformat(timespec="seconds"), int(exists["id"])),
+                        (
+                            self._enc("초과 근무를 입력하세요"),
+                            datetime.now().isoformat(timespec="seconds"),
+                            int(exists["id"]),
+                        ),
                     )
                     self.conn.commit()
+        window_version_key = "fixed_overtime_window_version"
+        if self.get_setting(window_version_key) != "2":
+            now = datetime.now()
+            fixed_rows = self.conn.execute(
+                "SELECT id, schedule_type, notify_time FROM notification_rules "
+                "WHERE fixed_key IN ('weekday_overtime', 'weekend_overtime')"
+            ).fetchall()
+            for row in fixed_rows:
+                next_at = self._next_notification_at(
+                    str(row["schedule_type"]),
+                    notify_time=str(row["notify_time"]),
+                    reference=now,
+                )
+                self.conn.execute(
+                    "UPDATE notification_rules SET next_trigger_at=?, updated_at=? WHERE id=?",
+                    (
+                        next_at.isoformat(timespec="seconds"),
+                        now.isoformat(timespec="seconds"),
+                        int(row["id"]),
+                    ),
+                )
+            self.conn.commit()
+            self.set_setting(window_version_key, "2")
 
     def list_notifications(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM notification_rules ORDER BY enabled DESC, next_trigger_at, id").fetchall()

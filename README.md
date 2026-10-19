@@ -1,6 +1,6 @@
-# 간편 플래너
+# Task It Easy
 
-<img src="assets/app_icon.png" alt="간편 플래너 아이콘" width="128">
+<img src="assets/app_icon.png" alt="Task It Easy 아이콘" width="128">
 
 공공기관 업무용 PC에서 인터넷이나 외부 서버 없이 실행하는 개인용 민원·수시업무 기한 관리 MVP입니다.
 
@@ -60,7 +60,7 @@ python app.py
 
 ## Windows EXE
 
-GitHub Release에서 `EasyPlanner.exe`를 내려받으면 Python 설치 없이 실행할 수 있습니다. Windows가 처음 실행하는 파일에 대해 보호 경고를 표시할 수 있으므로, 배포 전 기관 내부 보안 기준에 따라 검사한 뒤 사용하세요.
+GitHub Release에서 `Task It Easy.exe`를 내려받으면 Python 설치 없이 실행할 수 있습니다. Windows가 처음 실행하는 파일에 대해 보호 경고를 표시할 수 있으므로, 배포 전 기관 내부 보안 기준에 따라 검사한 뒤 사용하세요.
 
 개발자가 EXE를 다시 만들 때는 PowerShell에서 다음 명령을 실행합니다.
 
@@ -74,7 +74,7 @@ GitHub Release에서 `EasyPlanner.exe`를 내려받으면 Python 설치 없이 �
 & '.\빌드.ps1'
 ```
 
-완성 파일은 `dist\EasyPlanner.exe`에 생성됩니다. 배포용 EXE의 프로그램 데이터는 EXE 옆이 아니라 `%LOCALAPPDATA%\내일정관리`에 저장됩니다.
+완성 파일은 `dist\Task It Easy.exe`에 생성됩니다. 배포용 EXE의 프로그램 데이터는 EXE 옆이 아니라 `%LOCALAPPDATA%\내일정관리`에 저장됩니다.
 
 ## 데이터 저장
 

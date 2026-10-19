@@ -44,7 +44,7 @@ class CoreFlowTests(unittest.TestCase):
                 self.assertEqual(default_data_dir(), self.root / RELEASE_APP_DIR_NAME)
 
     def test_packaged_app_prefers_portable_data_beside_executable(self) -> None:
-        executable = self.root / "EasyPlanner.exe"
+        executable = self.root / "Task It Easy.exe"
         portable = self.root / "data"
         portable.mkdir()
         (portable / "portable.marker").write_text("portable", encoding="utf-8")
@@ -167,7 +167,7 @@ class CoreFlowTests(unittest.TestCase):
         self.assertGreater(backup.stat().st_size, 0)
 
     def test_portable_backup_contains_executable_database_and_attachments(self) -> None:
-        executable = self.root / "EasyPlanner.exe"
+        executable = self.root / "Task It Easy.exe"
         executable.write_bytes(b"sample-executable")
         attachment = self.root / "sample.txt"
         attachment.write_text("attachment", encoding="utf-8")
@@ -179,7 +179,7 @@ class CoreFlowTests(unittest.TestCase):
         create_portable_backup_archive(self.db, executable, target)
         with zipfile.ZipFile(target) as archive:
             names = set(archive.namelist())
-        self.assertIn("EasyPlanner.exe", names)
+        self.assertIn("Task It Easy.exe", names)
         self.assertIn("data/schedule.db", names)
         self.assertIn("data/portable.marker", names)
         self.assertTrue(any(name.startswith("data/attachments/") for name in names))
@@ -212,7 +212,7 @@ class CoreFlowTests(unittest.TestCase):
         items = self.db.list_notifications()
         fixed = [item for item in items if item["fixed_key"]]
         self.assertEqual({item["title"] for item in fixed}, {"평일 초과근무", "주말 초과근무"})
-        self.assertEqual({item["message"] for item in fixed}, {"초과근무 시간 입력"})
+        self.assertEqual({item["message"] for item in fixed}, {"초과 근무를 입력하세요"})
         self.assertEqual(len(fixed), 2)
         with self.assertRaisesRegex(ValueError, "삭제할 수 없습니다"):
             self.db.delete_notification(int(fixed[0]["id"]))
@@ -238,11 +238,16 @@ class CoreFlowTests(unittest.TestCase):
             "weekday_overtime", notify_time="15", reference=weekday_reference
         )
         self.assertEqual(weekday_next, datetime(2026, 10, 16, 18, 15, 0))
+        weekday_late_reference = datetime(2026, 10, 16, 23, 20, 0)  # Friday
+        weekday_after_weekend = Database._next_notification_at(
+            "weekday_overtime", notify_time="15", reference=weekday_late_reference
+        )
+        self.assertEqual(weekday_after_weekend, datetime(2026, 10, 19, 0, 15, 0))
         weekend_reference = datetime(2026, 10, 17, 23, 20, 0)  # Saturday
         weekend_next = Database._next_notification_at(
             "weekend_overtime", notify_time="15", reference=weekend_reference
         )
-        self.assertEqual(weekend_next, datetime(2026, 10, 18, 6, 15, 0))
+        self.assertEqual(weekend_next, datetime(2026, 10, 18, 0, 15, 0))
 
     def test_processing_stage_change_is_recorded(self) -> None:
         complaint_id = self.db.add_complaint(
