@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import ctypes
 import json
 import os
 import secrets
@@ -88,6 +89,16 @@ def enable_file_drop(widget: tk.Misc, callback: Callable[[list[Path]], None]) ->
 def resource_path(relative_path: str) -> Path:
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / relative_path
+
+
+def load_private_font(font_path: Path) -> bool:
+    """Load a bundled font for this process without installing it in Windows."""
+    if sys.platform != "win32" or not font_path.is_file():
+        return False
+    try:
+        return bool(ctypes.windll.gdi32.AddFontResourceExW(str(font_path), 0x10, 0))
+    except (AttributeError, OSError):
+        return False
 
 
 def create_portable_backup_archive(db: Database, executable: Path, destination: Path) -> None:
@@ -331,6 +342,7 @@ class FormDialog(tk.Toplevel):
 
 class ScheduleApp(tk.Tk):
     def __init__(self, db: Database):
+        self._fredoka_loaded = load_private_font(resource_path("assets/fonts/Fredoka-Bold.ttf"))
         super().__init__()
         self.db = db
         self.import_path: Path | None = None
@@ -372,7 +384,7 @@ class ScheduleApp(tk.Tk):
             (name for name in ("NanumGothic", "나눔고딕", "Arial Rounded MT Bold", "맑은 고딕") if name in installed_fonts),
             "맑은 고딕",
         )
-        self.brand_font = next(
+        self.brand_font = "Fredoka" if self._fredoka_loaded else next(
             (
                 name
                 for name in ("Arial Rounded MT Bold", "Segoe UI Black", "Franklin Gothic Heavy", "Arial Black")
@@ -380,6 +392,7 @@ class ScheduleApp(tk.Tk):
             ),
             self.ui_font,
         )
+        self.brand_tk_font = tkfont.Font(self, family=self.brand_font, size=24, weight="bold")
         self.input_font = tkfont.Font(self, family=self.ui_font, size=10, weight="normal")
         for named_font in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont"):
             try:
@@ -429,12 +442,6 @@ class ScheduleApp(tk.Tk):
         style.configure("TLabelframe", background=PALETTE["surface"], bordercolor=PALETTE["border"])
         style.configure("TLabelframe.Label", font=(self.ui_font, 10, "bold"), background=PALETTE["background"], foreground=PALETTE["green_dark"])
         style.configure("Title.TLabel", font=(self.ui_font, 25, "bold"), foreground=PALETTE["green_dark"])
-        style.configure(
-            "Brand.TLabel",
-            font=(self.brand_font, 44, "bold"),
-            foreground="#24324A",
-            background=PALETTE["background"],
-        )
         style.configure("Subtitle.TLabel", font=(self.ui_font, 12, "bold"), foreground="#465B4B")
         style.configure("Card.TFrame", background="#FFFFFF", relief="solid", borderwidth=1, bordercolor="#C8D0C5")
         style.configure("CardValueBlack.TLabel", font=(self.ui_font, 32, "bold"), foreground="#202020", background="#FFFFFF")
@@ -459,11 +466,24 @@ class ScheduleApp(tk.Tk):
         style.configure("Hidden.TNotebook", background=PALETTE["background"], borderwidth=0, tabmargins=0)
         style.configure("Treeview", rowheight=100, font=(self.ui_font, 9), background=PALETTE["surface"], fieldbackground=PALETTE["surface"], foreground=PALETTE["text"], bordercolor="#B8C9B5", borderwidth=1, relief="solid")
         style.map("Treeview", background=[("selected", "#A9DDA4")], foreground=[("selected", "#173B23")])
-        style.configure("Treeview.Heading", font=(self.ui_font, 9, "bold"), background=PALETTE["green_soft"], foreground=PALETTE["green_dark"], bordercolor="#D9E5D6")
+        style.configure(
+            "Treeview.Heading",
+            font=(self.ui_font, 11, "bold"),
+            padding=(6, 8),
+            background=PALETTE["green_soft"],
+            foreground=PALETTE["green_dark"],
+            bordercolor="#D9E5D6",
+        )
         style.map("Treeview.Heading", background=[("active", "#C4E7B9")])
         style.configure("Calendar.Treeview", rowheight=34, font=(self.ui_font, 9), background="#FFFFFF", fieldbackground="#FFFFFF", foreground=PALETTE["text"], bordercolor="#B8C9B5", borderwidth=1)
         style.map("Calendar.Treeview", background=[("selected", "#A9DDA4")], foreground=[("selected", "#173B23")])
-        style.configure("Calendar.Treeview.Heading", font=(self.ui_font, 9, "bold"), background=PALETTE["green_soft"], foreground=PALETTE["green_dark"])
+        style.configure(
+            "Calendar.Treeview.Heading",
+            font=(self.ui_font, 11, "bold"),
+            padding=(6, 8),
+            background=PALETTE["green_soft"],
+            foreground=PALETTE["green_dark"],
+        )
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=(22, 18))
@@ -472,7 +492,14 @@ class ScheduleApp(tk.Tk):
         header.pack(fill="x")
         header.columnconfigure(0, weight=1)
         header.columnconfigure(2, weight=1)
-        ttk.Label(header, text=APP_TITLE, style="Brand.TLabel").grid(row=0, column=1, pady=(0, 4))
+        tk.Label(
+            header,
+            text=APP_TITLE,
+            font=self.brand_tk_font,
+            foreground="#24324A",
+            background=PALETTE["background"],
+            borderwidth=0,
+        ).grid(row=0, column=1, pady=(0, 4))
         ttk.Label(header, text="© 2026 이주삼", style="Subtitle.TLabel").grid(
             row=0,
             column=2,
@@ -1559,7 +1586,7 @@ class ScheduleApp(tk.Tk):
         if item["schedule_type"] == "daily":
             return f"매일 {item['notify_time']}"
         if item["schedule_type"] == "weekday_overtime":
-            return f"평일 00~09시·18~23시 / 매시 {int(item['notify_time']):02d}분"
+            return f"평일 00~08시·18~23시 / 매시 {int(item['notify_time']):02d}분"
         if item["schedule_type"] == "weekend_overtime":
             return f"주말 00~23시 / 매시 {int(item['notify_time']):02d}분"
         return f"{item['interval_minutes']}분마다"
@@ -1567,7 +1594,7 @@ class ScheduleApp(tk.Tk):
     @staticmethod
     def _fixed_notification_window_text(schedule_type: str) -> str:
         if schedule_type == "weekday_overtime":
-            return "평일 00~09시·18~23시"
+            return "평일 00~08시·18~23시"
         return "주말 00~23시"
 
     def _selected_notification_id(self) -> int | None:
@@ -2806,6 +2833,72 @@ class ScheduleApp(tk.Tk):
     def open_task_stage_editor(self) -> None:
         self._open_inline_stage_editor(task_mode=True)
 
+    @staticmethod
+    def _sync_stage_names(
+        stages: list[dict[str, object]], template: list[dict[str, object]]
+    ) -> list[dict[str, object]]:
+        """Copy matching stage and branch names without replacing an item's custom structure."""
+        synced = json.loads(json.dumps(stages, ensure_ascii=False))
+        stage_names = {str(stage["id"]): str(stage.get("name", "")) for stage in template}
+        branch_names = {
+            (str(stage["id"]), str(branch["id"])): str(branch.get("name", ""))
+            for stage in template
+            for branch in stage.get("branches", [])
+        }
+        for stage in synced:
+            stage_id = str(stage.get("id", ""))
+            if stage_id in stage_names:
+                stage["name"] = stage_names[stage_id]
+            for branch in stage.get("branches", []):
+                key = (stage_id, str(branch.get("id", "")))
+                if key in branch_names:
+                    branch["name"] = branch_names[key]
+        return synced
+
+    def _apply_stage_names_to_existing_items(
+        self, task_mode: bool, new_config: list[dict[str, object]]
+    ) -> None:
+        """Apply renamed global definitions to all non-deleted existing work items."""
+        items = self.db.list_tasks(include_completed=True) if task_mode else self.db.list_complaints(include_completed=True)
+        for item in items:
+            if item.get("status") == "삭제":
+                continue
+            raw_custom = item.get("stage_config")
+            custom_stages: list[dict[str, object]] | None = None
+            if raw_custom:
+                try:
+                    loaded = json.loads(str(raw_custom))
+                    if isinstance(loaded, list) and loaded:
+                        custom_stages = loaded
+                except (json.JSONDecodeError, TypeError):
+                    custom_stages = None
+
+            state = self._task_progress_state(item) if task_mode else self._progress_state(item)
+            stages_after = (
+                self._sync_stage_names(custom_stages, new_config)
+                if custom_stages is not None
+                else json.loads(json.dumps(new_config, ensure_ascii=False))
+            )
+            nodes = self._progress_node_keys(stages_after)
+            if not nodes:
+                continue
+            current = str(state.get("current", ""))
+            if current not in nodes:
+                current = nodes[0]
+            completed = [key for key in state.get("completed", []) if key in nodes]
+            normalized_state = {"current": current, "completed": completed}
+            if custom_stages is not None:
+                self.db.update_item_stage_config(
+                    "task" if task_mode else "complaint",
+                    int(item["id"]),
+                    stages_after,
+                )
+            stage_text = self._definition_text_from_key(current, stages_after)
+            if task_mode:
+                self.db.update_task_progress_state(int(item["id"]), normalized_state, stage_text)
+            else:
+                self.db.update_progress_state(int(item["id"]), normalized_state, stage_text)
+
     def open_item_stage_editor(self, kind: str, item_id: int) -> None:
         if kind == "complaint":
             item = self.db.complaint_by_id(item_id)
@@ -2848,8 +2941,8 @@ class ScheduleApp(tk.Tk):
         ttk.Label(body, text=window.title(), style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             body,
-            text=("이 단계 구성은 선택한 업무에만 적용되며 변경 내용은 자동 저장됩니다."
-                  if item_kind else "각 단계의 글상자를 바로 편집할 수 있습니다. 변경 내용은 자동 저장됩니다."),
+            text=("이 단계 구성은 선택한 업무에만 적용됩니다. 저장을 눌러야 변경 내용이 반영됩니다."
+                  if item_kind else "저장하면 변경 내용이 등록된 모든 업무에 함께 적용됩니다."),
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(2, 12))
 
@@ -2869,20 +2962,20 @@ class ScheduleApp(tk.Tk):
             if item_kind and item_id is not None:
                 self.db.update_item_stage_config(item_kind, item_id, working)
             elif task_mode:
+                self._apply_stage_names_to_existing_items(True, working)
                 self.task_stage_config = working
                 self._save_task_stage_config()
             else:
+                self._apply_stage_names_to_existing_items(False, working)
                 self.stage_config = working
                 self._save_stage_config()
 
         def update_name(item: dict[str, object], variable: tk.StringVar) -> None:
             item["name"] = variable.get()
-            persist()
 
         def add_stage() -> None:
             stage: dict[str, object] = {"id": uuid.uuid4().hex, "name": "새 단계", "branches": []}
             working.append(stage)
-            persist()
             redraw()
             canvas.yview_moveto(1.0)
 
@@ -2891,25 +2984,21 @@ class ScheduleApp(tk.Tk):
                 messagebox.showwarning("삭제할 수 없음", "단계는 최소 1개가 필요합니다.", parent=window)
                 return
             working.pop(index)
-            persist()
             redraw()
 
         def move_stage(index: int, direction: int) -> None:
             target = index + direction
             if 0 <= target < len(working):
                 working[index], working[target] = working[target], working[index]
-                persist()
                 redraw()
 
         def add_branch(stage_index: int) -> None:
             branches = working[stage_index].setdefault("branches", [])
             branches.append({"id": uuid.uuid4().hex, "name": "새 세부 분기"})
-            persist()
             redraw()
 
         def delete_branch(stage_index: int, branch_index: int) -> None:
             working[stage_index].setdefault("branches", []).pop(branch_index)
-            persist()
             redraw()
 
         def redraw() -> None:
@@ -2945,15 +3034,19 @@ class ScheduleApp(tk.Tk):
                     ).pack(side="right", padx=(8, 0))
                 ttk.Button(panel, text="+ 세부 분기 추가", command=lambda index=stage_index: add_branch(index)).pack(anchor="w", padx=(36, 0), pady=(9, 0))
 
-        def close_editor() -> None:
+        def save_editor() -> None:
             persist()
             self.refresh_all()
+            window.destroy()
+
+        def close_editor() -> None:
             window.destroy()
 
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(12, 0))
         ttk.Button(actions, text="+ 단계 추가", style="Accent.TButton", command=add_stage).pack(side="left")
-        ttk.Button(actions, text="닫기", style="Accent.TButton", command=close_editor).pack(side="right")
+        ttk.Button(actions, text="닫기", command=close_editor).pack(side="right")
+        ttk.Button(actions, text="저장", style="Accent.TButton", command=save_editor).pack(side="right", padx=(0, 6))
         window.protocol("WM_DELETE_WINDOW", close_editor)
         redraw()
 

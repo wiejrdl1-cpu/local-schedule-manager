@@ -336,7 +336,7 @@ class Database:
             except (ValueError, TypeError):
                 raise ValueError("알림 분은 0분부터 59분 사이로 선택하세요.") from None
             hours = (
-                (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 18, 19, 20, 21, 22, 23)
+                (0, 1, 2, 3, 4, 5, 6, 7, 8, 18, 19, 20, 21, 22, 23)
                 if schedule_type == "weekday_overtime"
                 else tuple(range(24))
             )
@@ -444,7 +444,7 @@ class Database:
                     )
                     self.conn.commit()
         window_version_key = "fixed_overtime_window_version"
-        if self.get_setting(window_version_key) != "2":
+        if self.get_setting(window_version_key) != "3":
             now = datetime.now()
             fixed_rows = self.conn.execute(
                 "SELECT id, schedule_type, notify_time FROM notification_rules "
@@ -465,7 +465,7 @@ class Database:
                     ),
                 )
             self.conn.commit()
-            self.set_setting(window_version_key, "2")
+            self.set_setting(window_version_key, "3")
 
     def list_notifications(self) -> list[dict[str, Any]]:
         rows = self.conn.execute("SELECT * FROM notification_rules ORDER BY enabled DESC, next_trigger_at, id").fetchall()

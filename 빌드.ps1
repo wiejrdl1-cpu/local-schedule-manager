@@ -39,6 +39,8 @@ try {
         --name 'Task It Easy' `
         --icon 'assets\app_icon.ico' `
         --add-data 'assets\app_icon.ico;assets' `
+        --add-data 'assets\fonts\Fredoka-Bold.ttf;assets\fonts' `
+        --add-data 'assets\fonts\OFL-Fredoka.txt;assets\fonts' `
         --collect-data 'holidays' `
         --paths '.vendor' `
         --hidden-import 'xlrd' `

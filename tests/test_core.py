@@ -233,7 +233,7 @@ class CoreFlowTests(unittest.TestCase):
         )
 
     def test_fixed_overtime_notification_time_windows(self) -> None:
-        weekday_reference = datetime(2026, 10, 16, 9, 20, 0)  # Friday
+        weekday_reference = datetime(2026, 10, 16, 9, 5, 0)  # Friday, after the morning window
         weekday_next = Database._next_notification_at(
             "weekday_overtime", notify_time="15", reference=weekday_reference
         )
@@ -561,6 +561,58 @@ class CoreFlowTests(unittest.TestCase):
         updated = self.db.task_by_id(task_id)
         self.assertEqual(updated["processing_stage"], "처리중 > 결재")
         self.assertIn("b:working:review", updated["progress_state"])
+
+    def test_global_stage_name_changes_can_update_existing_complaints_and_tasks(self) -> None:
+        app = object.__new__(ScheduleApp)
+        app.db = self.db
+        old_config = [
+            {"id": "received", "name": "접수", "branches": []},
+            {
+                "id": "working",
+                "name": "처리중",
+                "branches": [{"id": "review", "name": "검토"}],
+            },
+        ]
+        new_config = [
+            {"id": "received", "name": "신규 접수", "branches": []},
+            {
+                "id": "working",
+                "name": "진행중",
+                "branches": [{"id": "review", "name": "서류 검토"}],
+            },
+        ]
+        app.stage_config = json.loads(json.dumps(old_config, ensure_ascii=False))
+        app.task_stage_config = json.loads(json.dumps(old_config, ensure_ascii=False))
+        complaint_id = self.db.add_complaint(
+            {
+                "receipt_no": "R-RENAME-001",
+                "complaint_name": "단계 이름 일괄 적용 시험",
+                "processing_stage": "처리중 > 검토",
+                "received_at": "2026-10-20",
+                "registered_at": "2026-10-20",
+                "deadline": "2026-10-30",
+                "applicant_name": "가상민원인",
+            }
+        )
+        task_id = self.db.add_task(
+            {
+                "title": "업무 단계 이름 일괄 적용 시험",
+                "registered_at": "2026-10-20",
+                "deadline": "2026-10-30",
+                "processing_stage": "처리중 > 검토",
+            }
+        )
+        state = {"current": "b:working:review", "completed": ["s:received"]}
+        self.db.update_progress_state(complaint_id, state, "처리중 > 검토")
+        self.db.update_task_progress_state(task_id, state, "처리중 > 검토")
+
+        app._apply_stage_names_to_existing_items(False, new_config)
+        app._apply_stage_names_to_existing_items(True, new_config)
+
+        self.assertEqual(self.db.complaint_by_id(complaint_id)["processing_stage"], "진행중 > 서류 검토")
+        self.assertEqual(self.db.task_by_id(task_id)["processing_stage"], "진행중 > 서류 검토")
+        self.assertEqual(self.db.complaint_by_id(complaint_id)["stage_config"], "")
+        self.assertEqual(self.db.task_by_id(task_id)["stage_config"], "")
 
     def test_dashboard_deadline_filters_match_card_counts(self) -> None:
         today = date.today()
