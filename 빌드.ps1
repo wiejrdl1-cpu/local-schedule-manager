@@ -36,11 +36,13 @@ try {
         --clean `
         --onefile `
         --windowed `
+        --runtime-tmpdir 'C:\Users\Public\Documents\TaskItEasyTemp' `
         --name 'Task It Easy' `
         --icon 'assets\app_icon.ico' `
         --add-data 'assets\app_icon.ico;assets' `
         --add-data 'assets\fonts\Fredoka-Bold.ttf;assets\fonts' `
         --add-data 'assets\fonts\OFL-Fredoka.txt;assets\fonts' `
+        --additional-hooks-dir 'build_hooks' `
         --collect-data 'holidays' `
         --paths '.vendor' `
         --hidden-import 'xlrd' `
@@ -56,6 +58,19 @@ try {
 $ExePath = Join-Path $ProjectDir 'dist\Task It Easy.exe'
 if (-not (Test-Path -LiteralPath $ExePath)) {
     throw 'The built EXE file was not found.'
+}
+
+$ArchiveViewer = Join-Path $ProjectDir '.venv-build\Scripts\pyi-archive_viewer.exe'
+$ArchiveListing = & $ArchiveViewer -r -b $ExePath
+$TkinterIncluded = (
+    $LASTEXITCODE -eq 0 -and
+    $ArchiveListing -match '(?m)^ _tkinter\.pyd$' -and
+    $ArchiveListing -match '(?m)^ tkinter$' -and
+    $ArchiveListing -match '(?m)^ _tcl_data\\init\.tcl$' -and
+    $ArchiveListing -match '(?m)^ _tk_data\\tk\.tcl$'
+)
+if (-not $TkinterIncluded) {
+    throw 'EXE verification failed: tkinter was not bundled.'
 }
 
 Write-Host "EXE build completed: $ExePath"
