@@ -29,6 +29,32 @@ try {
     throw 'Build dependencies are missing. Run this script with -InstallDependencies first.'
 }
 
+$SplashPath = Join-Path $ProjectDir 'assets\splash.png'
+if (-not (Test-Path -LiteralPath $SplashPath)) {
+    throw 'Splash image is missing. Run assets\create_splash.ps1 first.'
+}
+
+$VenvConfig = Join-Path $ProjectDir '.venv-build\pyvenv.cfg'
+$PythonHomeLine = Get-Content -LiteralPath $VenvConfig -Encoding UTF8 | Where-Object { $_ -match '^home\s*=' } | Select-Object -First 1
+if (-not $PythonHomeLine) {
+    throw 'Build Python home could not be determined.'
+}
+$PythonHome = ($PythonHomeLine -replace '^home\s*=\s*', '').Trim()
+$SourceTclRoot = Join-Path $PythonHome 'tcl'
+$BuildTclRoot = 'C:\Users\Public\Documents\TaskItEasyBuildTcl'
+if (-not (Test-Path -LiteralPath (Join-Path $SourceTclRoot 'tcl8.6')) -or
+    -not (Test-Path -LiteralPath (Join-Path $SourceTclRoot 'tk8.6'))) {
+    throw 'Tcl/Tk build libraries were not found.'
+}
+New-Item -ItemType Directory -Path $BuildTclRoot -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $SourceTclRoot 'tcl8.6') -Destination $BuildTclRoot -Recurse -Force
+Copy-Item -LiteralPath (Join-Path $SourceTclRoot 'tk8.6') -Destination $BuildTclRoot -Recurse -Force
+
+$PreviousTclLibrary = $env:TCL_LIBRARY
+$PreviousTkLibrary = $env:TK_LIBRARY
+$env:TCL_LIBRARY = Join-Path $BuildTclRoot 'tcl8.6'
+$env:TK_LIBRARY = Join-Path $BuildTclRoot 'tk8.6'
+
 Push-Location $ProjectDir
 try {
     & $BuildPython -m PyInstaller `
@@ -36,6 +62,8 @@ try {
         --clean `
         --onefile `
         --windowed `
+        --splash 'assets\splash.png' `
+        --splash-center 'active' `
         --runtime-tmpdir 'C:\Users\Public\Documents\TaskItEasyTemp' `
         --name 'Task It Easy' `
         --icon 'assets\app_icon.ico' `
@@ -52,6 +80,8 @@ try {
         throw "EXE build failed with exit code $LASTEXITCODE"
     }
 } finally {
+    if ($null -eq $PreviousTclLibrary) { Remove-Item Env:TCL_LIBRARY -ErrorAction SilentlyContinue } else { $env:TCL_LIBRARY = $PreviousTclLibrary }
+    if ($null -eq $PreviousTkLibrary) { Remove-Item Env:TK_LIBRARY -ErrorAction SilentlyContinue } else { $env:TK_LIBRARY = $PreviousTkLibrary }
     Pop-Location
 }
 
@@ -71,6 +101,13 @@ $TkinterIncluded = (
 )
 if (-not $TkinterIncluded) {
     throw 'EXE verification failed: tkinter was not bundled.'
+}
+$SplashIncluded = (
+    $ArchiveListing -match '(?m)^ Splash-00\.res$' -and
+    $ArchiveListing -match '(?m)^ pyi_splash$'
+)
+if (-not $SplashIncluded) {
+    throw 'EXE verification failed: startup splash was not bundled.'
 }
 
 Write-Host "EXE build completed: $ExePath"

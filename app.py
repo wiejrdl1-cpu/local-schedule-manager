@@ -91,6 +91,16 @@ def resource_path(relative_path: str) -> Path:
     return base / relative_path
 
 
+def close_startup_splash() -> None:
+    """Close the PyInstaller splash once a usable window is ready."""
+    try:
+        import pyi_splash
+
+        pyi_splash.close()
+    except (ImportError, RuntimeError):
+        pass
+
+
 def load_private_font(font_path: Path) -> bool:
     """Load a bundled font for this process without installing it in Windows."""
     if sys.platform != "win32" or not font_path.is_file():
@@ -4518,6 +4528,7 @@ def unlock_database(db: Database) -> bool:
         db.enable_auto_unlock(password)
         helper.destroy()
         return True
+    close_startup_splash()
     messagebox.showinfo(
         "자동 시작 전환",
         "앞으로 비밀번호를 묻지 않도록 전환합니다.\n기존 데이터 확인을 위해 현재 비밀번호를 이번 한 번만 입력하세요.",
@@ -4545,6 +4556,8 @@ def main() -> int:
         db.close()
         return 1
     app = ScheduleApp(db)
+    app.update_idletasks()
+    close_startup_splash()
     app.mainloop()
     return 0
 
