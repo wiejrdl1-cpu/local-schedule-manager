@@ -4479,9 +4479,12 @@ class ScheduleApp(tk.Tk):
 
     def _check_custom_notifications(self) -> None:
         try:
-            for item in self.db.due_notifications():
-                self.db.mark_notification_triggered(int(item["id"]))
-                self._show_custom_notification(str(item["title"]), str(item["message"]))
+            reference = datetime.now()
+            for item in self.db.due_notifications(reference):
+                should_show = self.db.should_show_due_notification(item, reference)
+                self.db.mark_notification_triggered(int(item["id"]), reference)
+                if should_show:
+                    self._show_custom_notification(str(item["title"]), str(item["message"]))
             self.refresh_notifications()
             self.refresh_summary()
         except (tk.TclError, sqlite3.Error, ValueError):

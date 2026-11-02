@@ -554,6 +554,23 @@ class Database:
         ).fetchall()
         return [item for row in rows if (item := self.notification_by_id(int(row["id"]))) is not None]
 
+    @staticmethod
+    def should_show_due_notification(item: dict[str, Any], now: datetime | None = None) -> bool:
+        """Return whether a due notification should be shown at this moment.
+
+        Fixed overtime notifications are hourly prompts, not accumulated reminders.
+        If the app was closed during their scheduled minute, advance the schedule
+        silently instead of showing the missed prompt on the next launch.
+        """
+        if str(item.get("schedule_type", "")) not in {"weekday_overtime", "weekend_overtime"}:
+            return True
+        reference = now or datetime.now()
+        try:
+            scheduled_at = datetime.fromisoformat(str(item.get("next_trigger_at", "")))
+        except ValueError:
+            return False
+        return scheduled_at <= reference < scheduled_at + timedelta(minutes=1)
+
     def mark_notification_triggered(self, notification_id: int, now: datetime | None = None) -> None:
         reference = now or datetime.now()
         item = self.notification_by_id(notification_id)

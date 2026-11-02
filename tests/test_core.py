@@ -249,6 +249,42 @@ class CoreFlowTests(unittest.TestCase):
         )
         self.assertEqual(weekend_next, datetime(2026, 10, 18, 0, 15, 0))
 
+    def test_missed_overtime_notification_is_not_shown_after_scheduled_minute(self) -> None:
+        fixed = {
+            "schedule_type": "weekday_overtime",
+            "next_trigger_at": "2026-11-02T08:25:00",
+        }
+        self.assertTrue(
+            Database.should_show_due_notification(fixed, datetime(2026, 11, 2, 8, 25, 45))
+        )
+        self.assertFalse(
+            Database.should_show_due_notification(fixed, datetime(2026, 11, 2, 9, 7, 0))
+        )
+        self.assertTrue(
+            Database.should_show_due_notification(
+                {"schedule_type": "daily", "next_trigger_at": "2026-11-02T08:25:00"},
+                datetime(2026, 11, 2, 9, 7, 0),
+            )
+        )
+
+    def test_missed_overtime_notification_advances_without_catching_up(self) -> None:
+        self.db.ensure_default_notifications()
+        item = next(value for value in self.db.list_notifications() if value["fixed_key"] == "weekday_overtime")
+        self.db.conn.execute(
+            "UPDATE notification_rules SET notify_time=?, next_trigger_at=? WHERE id=?",
+            ("25", "2026-11-02T08:25:00", int(item["id"])),
+        )
+        self.db.conn.commit()
+        reference = datetime(2026, 11, 2, 9, 7, 0)
+        due = self.db.due_notifications(reference)
+        self.assertEqual([value["id"] for value in due], [item["id"]])
+        self.assertFalse(self.db.should_show_due_notification(due[0], reference))
+        self.db.mark_notification_triggered(int(item["id"]), reference)
+        self.assertEqual(
+            self.db.notification_by_id(int(item["id"]))["next_trigger_at"],
+            "2026-11-02T18:25:00",
+        )
+
     def test_processing_stage_change_is_recorded(self) -> None:
         complaint_id = self.db.add_complaint(
             {
